@@ -422,9 +422,9 @@ public class MigrationManager {
 
             try {
                 File encFile = new File(dir, f.getName() + ".enc");
-                boolean success = StreamingFileEncryptor.encryptFile(
+                String headerB64 = StreamingFileEncryptor.encryptFile(
                         f.getAbsolutePath(), encFile.getAbsolutePath(), uek);
-                if (success && encFile.exists() && encFile.length() > 0) {
+                if (headerB64 != null && encFile.exists() && encFile.length() > 0) {
                     // Delete original plaintext file
                     f.delete();
                     // Rename encrypted file to original name
