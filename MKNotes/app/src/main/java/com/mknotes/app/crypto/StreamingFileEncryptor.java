@@ -4,6 +4,7 @@ import android.util.Base64;
 import android.util.Log;
 
 import com.goterl.lazysodium.SodiumAndroid;
+import com.goterl.lazysodium.interfaces.SecretStream;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -71,9 +72,9 @@ public final class StreamingFileEncryptor {
         FileOutputStream fos = null;
 
         try {
-            // Initialize secretstream
+            // Initialize secretstream - using proper State object
             byte[] header = new byte[HEADER_LENGTH];
-            byte[] state = new byte[52]; // crypto_secretstream_xchacha20poly1305_STATEBYTES
+            SecretStream.State state = new SecretStream.State();
 
             int initResult = sodium.crypto_secretstream_xchacha20poly1305_init_push(
                     state, header, key);
@@ -90,8 +91,7 @@ public final class StreamingFileEncryptor {
 
             byte[] buffer = new byte[CHUNK_SIZE];
             byte[] cipherBuffer = new byte[CHUNK_SIZE + ABYTES];
-            // FIX: Changed from int[] to long[]
-            long[] cipherLen = new long[1];
+            int[] cipherLen = new int[1];
             int bytesRead;
             long totalRead = 0;
             long fileSize = inputFile.length();
@@ -117,7 +117,7 @@ public final class StreamingFileEncryptor {
                     return null;
                 }
 
-                fos.write(cipherBuffer, 0, (int) cipherLen[0]);
+                fos.write(cipherBuffer, 0, cipherLen[0]);
             }
 
             fos.flush();
@@ -172,8 +172,8 @@ public final class StreamingFileEncryptor {
                 return false;
             }
 
-            // Initialize secretstream for decryption
-            byte[] state = new byte[52];
+            // Initialize secretstream for decryption - using proper State object
+            SecretStream.State state = new SecretStream.State();
             int initResult = sodium.crypto_secretstream_xchacha20poly1305_init_pull(
                     state, header, key);
             if (initResult != 0) {
@@ -186,8 +186,7 @@ public final class StreamingFileEncryptor {
             int chunkReadSize = CHUNK_SIZE + ABYTES;
             byte[] cipherBuffer = new byte[chunkReadSize];
             byte[] plainBuffer = new byte[CHUNK_SIZE];
-            // FIX: Changed from int[] to long[]
-            long[] plainLen = new long[1];
+            int[] plainLen = new int[1];
             byte[] tagOut = new byte[1];
             int bytesRead;
 
@@ -208,7 +207,7 @@ public final class StreamingFileEncryptor {
                     return false;
                 }
 
-                fos.write(plainBuffer, 0, (int) plainLen[0]);
+                fos.write(plainBuffer, 0, plainLen[0]);
 
                 // Check for FINAL tag
                 if (tagOut[0] == 3) {
