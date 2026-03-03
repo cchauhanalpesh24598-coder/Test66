@@ -3,17 +3,18 @@ package com.mknotes.app.crypto;
 import android.util.Base64;
 import android.util.Log;
 
+import com.goterl.lazysodium.LazySodiumAndroid;
 import com.goterl.lazysodium.SodiumAndroid;
+import com.goterl.lazysodium.interfaces.SecretStream;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 
 /**
- * Streaming file encryption using XChaCha20-Poly1305 via lazysodium.
+ * Streaming file encryption using XChaCha20-Poly1305 via lazysodium 5.x.
  *
  * Uses crypto_secretstream_xchacha20poly1305 for large file streaming:
  * - 64KB chunk size
@@ -21,29 +22,25 @@ import java.security.SecureRandom;
  * - Each chunk is authenticated
  * - Final chunk tagged with TAG_FINAL
  *
- * For small files (< 1MB), uses in-memory XChaCha20-Poly1305 AEAD.
- *
- * File format:
- * - Encrypted file: [header(24 bytes)][chunk1][chunk2]...[chunkN(TAG_FINAL)]
- * - Metadata JSON: {"header":"base64","originalName":"...","size":N}
+ * FIXED for lazysodium 5.x: State is now SecretStream.State object, not byte[]
  */
 public final class StreamingFileEncryptor {
 
     private static final String TAG = "StreamingFileEncryptor";
 
-    /** Chunk size for streaming encryption: 64KB */
-    private static final int CHUNK_SIZE = 64 * 1024;
-
-    /** secretstream header length: 24 bytes */
-    private static final int HEADER_LENGTH = 24;
-
-    /** secretstream ABYTES (auth tag per chunk): 17 bytes */
-    private static final int ABYTES = 17;
+    private static final int CHUNK_SIZE = 64 * 1024; // 64KB
+    private static final int HEADER_LENGTH = 24;      // secretstream header
+    private static final int ABYTES = 17;             // auth tag per chunk
 
     private static final SecureRandom sRandom = new SecureRandom();
 
-    private StreamingFileEncryptor() {
-        // Static utility class
+    private StreamingFileEncryptor() {}
+
+    /**
+     * Get LazySodiumAndroid instance.
+     */
+    private static LazySodiumAndroid getLazySodium() {
+        return new LazySodiumAndroid(new SodiumAndroid());
     }
 
     /**
@@ -66,18 +63,20 @@ public final class StreamingFileEncryptor {
             return null;
         }
 
-        SodiumAndroid sodium = CryptoManager.getSodium();
         FileInputStream fis = null;
         FileOutputStream fos = null;
 
         try {
-            // Initialize secretstream
-            byte[] header = new byte[HEADER_LENGTH];
-            byte[] state = new byte[52]; // crypto_secretstream_xchacha20poly1305_STATEBYTES
+            LazySodiumAndroid sodium = getLazySodium();
 
-            int initResult = sodium.crypto_secretstream_xchacha20poly1305_init_push(
-                    state, header, key);
-            if (initResult != 0) {
+            // Initialize secretstream — lazysodium 5.x returns State object
+            byte[] header = new byte[HEADER_LENGTH];
+
+            // ✅ FIX: State is SecretStream.State, not byte[]
+            SecretStream.State state = new SecretStream.State();
+
+            boolean initOk = sodium.cryptoSecretStreamInitPush(state, header, key);
+            if (!initOk) {
                 Log.e(TAG, "encryptFile: init_push failed");
                 return null;
             }
@@ -90,7 +89,7 @@ public final class StreamingFileEncryptor {
 
             byte[] buffer = new byte[CHUNK_SIZE];
             byte[] cipherBuffer = new byte[CHUNK_SIZE + ABYTES];
-            int[] cipherLen = new int[1];
+            long[] cipherLen = new long[1];
             int bytesRead;
             long totalRead = 0;
             long fileSize = inputFile.length();
@@ -100,10 +99,11 @@ public final class StreamingFileEncryptor {
                 boolean isLast = (totalRead >= fileSize);
 
                 byte msgTag = isLast
-                        ? (byte) 3 // crypto_secretstream_xchacha20poly1305_TAG_FINAL
-                        : (byte) 0; // crypto_secretstream_xchacha20poly1305_TAG_MESSAGE
+                        ? SecretStream.TAG_FINAL  // ✅ Use lazysodium constant
+                        : SecretStream.TAG_MESSAGE;
 
-                int pushResult = sodium.crypto_secretstream_xchacha20poly1305_push(
+                // ✅ FIX: lazysodium 5.x push signature with State object
+                boolean pushOk = sodium.cryptoSecretStreamPush(
                         state,
                         cipherBuffer, cipherLen,
                         buffer, bytesRead,
@@ -111,12 +111,12 @@ public final class StreamingFileEncryptor {
                         msgTag
                 );
 
-                if (pushResult != 0) {
+                if (!pushOk) {
                     Log.e(TAG, "encryptFile: push failed at offset=" + (totalRead - bytesRead));
                     return null;
                 }
 
-                fos.write(cipherBuffer, 0, cipherLen[0]);
+                fos.write(cipherBuffer, 0, (int) cipherLen[0]);
             }
 
             fos.flush();
@@ -124,7 +124,6 @@ public final class StreamingFileEncryptor {
 
         } catch (Exception e) {
             Log.e(TAG, "encryptFile exception: " + e.getMessage());
-            // Clean up partial output
             try {
                 File outFile = new File(outputPath);
                 if (outFile.exists()) outFile.delete();
@@ -156,11 +155,12 @@ public final class StreamingFileEncryptor {
             return false;
         }
 
-        SodiumAndroid sodium = CryptoManager.getSodium();
         FileInputStream fis = null;
         FileOutputStream fos = null;
 
         try {
+            LazySodiumAndroid sodium = getLazySodium();
+
             fis = new FileInputStream(inputFile);
 
             // Read header from file
@@ -171,11 +171,11 @@ public final class StreamingFileEncryptor {
                 return false;
             }
 
-            // Initialize secretstream for decryption
-            byte[] state = new byte[52];
-            int initResult = sodium.crypto_secretstream_xchacha20poly1305_init_pull(
-                    state, header, key);
-            if (initResult != 0) {
+            // ✅ FIX: State is SecretStream.State, not byte[]
+            SecretStream.State state = new SecretStream.State();
+
+            boolean initOk = sodium.cryptoSecretStreamInitPull(state, header, key);
+            if (!initOk) {
                 Log.e(TAG, "decryptFile: init_pull failed (wrong key?)");
                 return false;
             }
@@ -185,12 +185,13 @@ public final class StreamingFileEncryptor {
             int chunkReadSize = CHUNK_SIZE + ABYTES;
             byte[] cipherBuffer = new byte[chunkReadSize];
             byte[] plainBuffer = new byte[CHUNK_SIZE];
-            int[] plainLen = new int[1];
+            long[] plainLen = new long[1];
             byte[] tagOut = new byte[1];
             int bytesRead;
 
             while ((bytesRead = fis.read(cipherBuffer)) > 0) {
-                int pullResult = sodium.crypto_secretstream_xchacha20poly1305_pull(
+                // ✅ FIX: lazysodium 5.x pull signature with State object
+                boolean pullOk = sodium.cryptoSecretStreamPull(
                         state,
                         plainBuffer, plainLen,
                         tagOut,
@@ -198,18 +199,17 @@ public final class StreamingFileEncryptor {
                         null, 0
                 );
 
-                if (pullResult != 0) {
+                if (!pullOk) {
                     Log.e(TAG, "decryptFile: pull failed (corrupted data or wrong key)");
-                    // Clean up partial output
                     closeQuietly(fos);
                     new File(outputPath).delete();
                     return false;
                 }
 
-                fos.write(plainBuffer, 0, plainLen[0]);
+                fos.write(plainBuffer, 0, (int) plainLen[0]);
 
                 // Check for FINAL tag
-                if (tagOut[0] == 3) {
+                if (tagOut[0] == SecretStream.TAG_FINAL) {
                     break;
                 }
             }
@@ -231,10 +231,6 @@ public final class StreamingFileEncryptor {
 
     /**
      * Encrypt small data in-memory using XChaCha20-Poly1305 AEAD.
-     *
-     * @param data plaintext bytes
-     * @param key  byte[32] encryption key
-     * @return CryptoManager.EncryptedBlob, or null on failure
      */
     public static CryptoManager.EncryptedBlob encryptBytes(byte[] data, byte[] key) {
         return CryptoManager.encryptBytes(data, key);
@@ -242,11 +238,6 @@ public final class StreamingFileEncryptor {
 
     /**
      * Decrypt small data in-memory using XChaCha20-Poly1305 AEAD.
-     *
-     * @param ciphertext encrypted bytes
-     * @param nonce      24-byte nonce
-     * @param key        byte[32] encryption key
-     * @return plaintext bytes, or null on failure
      */
     public static byte[] decryptBytes(byte[] ciphertext, byte[] nonce, byte[] key) {
         return CryptoManager.decryptBytes(ciphertext, nonce, key);
@@ -254,11 +245,6 @@ public final class StreamingFileEncryptor {
 
     /**
      * Generate metadata JSON for an encrypted file.
-     *
-     * @param headerB64    Base64-encoded secretstream header
-     * @param originalName original filename
-     * @param originalSize original file size in bytes
-     * @return metadata JSON string
      */
     public static String buildMetadataJson(String headerB64, String originalName, long originalSize) {
         return "{\"header\":\"" + headerB64 + "\","
