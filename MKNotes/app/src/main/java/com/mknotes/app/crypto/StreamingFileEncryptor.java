@@ -91,7 +91,7 @@ public final class StreamingFileEncryptor {
 
             byte[] buffer = new byte[CHUNK_SIZE];
             byte[] cipherBuffer = new byte[CHUNK_SIZE + ABYTES];
-            int[] cipherLen = new int[1];
+            long[] cipherLen = new long[1];  // Changed from int[] to long[]
             int bytesRead;
             long totalRead = 0;
             long fileSize = inputFile.length();
@@ -117,7 +117,7 @@ public final class StreamingFileEncryptor {
                     return null;
                 }
 
-                fos.write(cipherBuffer, 0, cipherLen[0]);
+                fos.write(cipherBuffer, 0, (int) cipherLen[0]);  // Cast to int for write method
             }
 
             fos.flush();
@@ -186,7 +186,7 @@ public final class StreamingFileEncryptor {
             int chunkReadSize = CHUNK_SIZE + ABYTES;
             byte[] cipherBuffer = new byte[chunkReadSize];
             byte[] plainBuffer = new byte[CHUNK_SIZE];
-            int[] plainLen = new int[1];
+            long[] plainLen = new long[1];  // Changed from int[] to long[]
             byte[] tagOut = new byte[1];
             int bytesRead;
 
@@ -207,7 +207,7 @@ public final class StreamingFileEncryptor {
                     return false;
                 }
 
-                fos.write(plainBuffer, 0, plainLen[0]);
+                fos.write(plainBuffer, 0, (int) plainLen[0]);  // Cast to int for write method
 
                 // Check for FINAL tag
                 if (tagOut[0] == 3) {
