@@ -7,6 +7,7 @@ import com.goterl.lazysodium.LazySodiumAndroid;
 import com.goterl.lazysodium.SodiumAndroid;
 import com.goterl.lazysodium.interfaces.AEAD;
 import com.goterl.lazysodium.interfaces.PwHash;
+import com.sun.jna.NativeLong;
 
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -145,7 +146,7 @@ public final class CryptoManager {
                     pwBytes, pwBytes.length,
                     salt,
                     ARGON2_OPS_LIMIT,
-                    ARGON2_MEM_LIMIT,
+                    new NativeLong(ARGON2_MEM_LIMIT),
                     ARGON2_ALG
             );
 
@@ -231,7 +232,7 @@ public final class CryptoManager {
 
             // Output buffer: message + tag (16 bytes)
             byte[] ciphertext = new byte[message.length + XCHACHA_TAG_LENGTH];
-            int[] ciphertextLen = new int[1];
+            long[] ciphertextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
@@ -248,7 +249,7 @@ public final class CryptoManager {
             }
 
             // Build JSON cipher format
-            String ctB64 = Base64.encodeToString(ciphertext, 0, ciphertextLen[0], Base64.NO_WRAP);
+            String ctB64 = Base64.encodeToString(ciphertext, 0, (int) ciphertextLen[0], Base64.NO_WRAP);
             String ivB64 = Base64.encodeToString(nonce, Base64.NO_WRAP);
 
             return "{\"alg\":\"" + ALG_IDENTIFIER + "\","
@@ -315,7 +316,7 @@ public final class CryptoManager {
 
             // Output buffer: ciphertext - tag (16 bytes)
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            int[] plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
@@ -331,7 +332,7 @@ public final class CryptoManager {
                 return null;
             }
 
-            return new String(plaintext, 0, plaintextLen[0], StandardCharsets.UTF_8);
+            return new String(plaintext, 0, (int) plaintextLen[0], StandardCharsets.UTF_8);
 
         } catch (Exception e) {
             Log.e(TAG, "decryptXChaCha failed: " + e.getMessage());
@@ -410,7 +411,7 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_LENGTH];
-            int[] ciphertextLen = new int[1];
+            long[] ciphertextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
@@ -427,7 +428,7 @@ public final class CryptoManager {
             }
 
             VaultBundle bundle = new VaultBundle();
-            bundle.encryptedDEK = Base64.encodeToString(ciphertext, 0, ciphertextLen[0], Base64.NO_WRAP);
+            bundle.encryptedDEK = Base64.encodeToString(ciphertext, 0, (int) ciphertextLen[0], Base64.NO_WRAP);
             bundle.iv = Base64.encodeToString(nonce, Base64.NO_WRAP);
             bundle.tag = ""; // Tag is embedded in ciphertext for XChaCha20-Poly1305
             return bundle;
@@ -467,7 +468,7 @@ public final class CryptoManager {
             }
 
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            int[] plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
@@ -559,7 +560,7 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[data.length + XCHACHA_TAG_LENGTH];
-            int[] ciphertextLen = new int[1];
+            long[] ciphertextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
@@ -573,7 +574,7 @@ public final class CryptoManager {
             if (!success) return null;
 
             EncryptedBlob blob = new EncryptedBlob();
-            blob.ciphertext = Arrays.copyOf(ciphertext, ciphertextLen[0]);
+            blob.ciphertext = Arrays.copyOf(ciphertext, (int) ciphertextLen[0]);
             blob.nonce = nonce;
             return blob;
 
@@ -595,7 +596,7 @@ public final class CryptoManager {
         if (ciphertext == null || nonce == null || key == null) return null;
         try {
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            int[] plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
             boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
@@ -607,7 +608,7 @@ public final class CryptoManager {
             );
 
             if (!success) return null;
-            return Arrays.copyOf(plaintext, plaintextLen[0]);
+            return Arrays.copyOf(plaintext, (int) plaintextLen[0]);
 
         } catch (Exception e) {
             Log.e(TAG, "decryptBytes failed: " + e.getMessage());
