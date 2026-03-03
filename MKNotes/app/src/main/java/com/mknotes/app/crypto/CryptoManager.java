@@ -7,7 +7,6 @@ import com.goterl.lazysodium.LazySodiumAndroid;
 import com.goterl.lazysodium.SodiumAndroid;
 import com.goterl.lazysodium.interfaces.AEAD;
 import com.goterl.lazysodium.interfaces.PwHash;
-import com.sun.jna.NativeLong;
 
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -141,15 +140,17 @@ public final class CryptoManager {
             byte[] key = new byte[KEY_LENGTH_BYTES];
             byte[] pwBytes = password.getBytes(StandardCharsets.UTF_8);
 
-            boolean success = getSodium().crypto_pwhash(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_pwhash(
                     key, key.length,
                     pwBytes, pwBytes.length,
                     salt,
                     ARGON2_OPS_LIMIT,
-                    new NativeLong(ARGON2_MEM_LIMIT),
+                    ARGON2_MEM_LIMIT,
                     ARGON2_ALG
             );
 
+            boolean success = (result == 0);
             if (success) {
                 return key;
             } else {
@@ -232,9 +233,11 @@ public final class CryptoManager {
 
             // Output buffer: message + tag (16 bytes)
             byte[] ciphertext = new byte[message.length + XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] ciphertextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
                     message, message.length,
                     null, 0,  // no additional data
@@ -242,6 +245,8 @@ public final class CryptoManager {
                     nonce,
                     key
             );
+
+            boolean success = (result == 0);
 
             if (!success) {
                 Log.e(TAG, "encrypt: crypto_aead_xchacha20poly1305_ietf_encrypt failed");
@@ -316,9 +321,11 @@ public final class CryptoManager {
 
             // Output buffer: ciphertext - tag (16 bytes)
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null,     // nsec (unused)
                     ciphertext, ciphertext.length,
@@ -326,6 +333,8 @@ public final class CryptoManager {
                     nonce,
                     key
             );
+
+            boolean success = (result == 0);
 
             if (!success) {
                 Log.w(TAG, "decryptXChaCha: decryption failed (wrong key or tampered)");
@@ -411,9 +420,11 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] ciphertextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
                     dek, dek.length,
                     null, 0,
@@ -421,6 +432,8 @@ public final class CryptoManager {
                     nonce,
                     wrapKey
             );
+
+            boolean success = (result == 0);
 
             if (!success) {
                 Log.e(TAG, "encryptDEK: encryption failed");
@@ -468,9 +481,11 @@ public final class CryptoManager {
             }
 
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null,
                     ciphertext, ciphertext.length,
@@ -478,6 +493,8 @@ public final class CryptoManager {
                     nonce,
                     wrapKey
             );
+
+            boolean success = (result == 0);
 
             if (!success) {
                 Log.w(TAG, "decryptDEK: decryption failed -- wrong key or tampered");
@@ -489,10 +506,10 @@ public final class CryptoManager {
                 return null;
             }
 
-            byte[] result = new byte[KEY_LENGTH_BYTES];
-            System.arraycopy(plaintext, 0, result, 0, KEY_LENGTH_BYTES);
+            byte[] resultKey = new byte[KEY_LENGTH_BYTES];
+            System.arraycopy(plaintext, 0, resultKey, 0, KEY_LENGTH_BYTES);
             zeroFill(plaintext);
-            return result;
+            return resultKey;
 
         } catch (Exception e) {
             Log.e(TAG, "decryptDEK failed: " + e.getMessage());
@@ -560,9 +577,11 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[data.length + XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] ciphertextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
                     data, data.length,
                     null, 0,
@@ -570,6 +589,8 @@ public final class CryptoManager {
                     nonce,
                     key
             );
+
+            boolean success = (result == 0);
 
             if (!success) return null;
 
@@ -596,9 +617,11 @@ public final class CryptoManager {
         if (ciphertext == null || nonce == null || key == null) return null;
         try {
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
+            // FIX: Changed from int[] to long[]
             long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            // FIX: Capture int result and check for success
+            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null,
                     ciphertext, ciphertext.length,
@@ -606,6 +629,8 @@ public final class CryptoManager {
                     nonce,
                     key
             );
+
+            boolean success = (result == 0);
 
             if (!success) return null;
             return Arrays.copyOf(plaintext, (int) plaintextLen[0]);
