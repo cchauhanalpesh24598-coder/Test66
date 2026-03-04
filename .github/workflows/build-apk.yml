@@ -1,36 +1,62 @@
-name: Generate Keystore (Run Once Only)
+name: Build APK Stable
 
 on:
+  push:
+    branches: [ master ]
   workflow_dispatch:
 
 jobs:
-  generate:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Generate Keystore and Print Base64
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ✅ Install Gradle
+      - name: Install Gradle
         run: |
-          keytool -genkeypair \
-            -keystore debug.keystore \
-            -storepass android123 \
-            -alias mknotes \
-            -keypass android123 \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 36500 \
-            -dname "CN=MKNotes,O=MKNotes,C=IN"
-          
-          echo "====== BASE64 KEYSTORE (copy this) ======"
-          base64 -w 0 debug.keystore
-          echo ""
-          echo "====== SHA-1 FINGERPRINT ======"
+          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip
+          unzip -q gradle-8.4-bin.zip
+          echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
+
+      # ✅ Keystore Secret se restore karo — har build mein SAME keystore
+      - name: Restore Keystore from Secret
+        run: |
+          mkdir -p MKNotes/app/keystore
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > MKNotes/app/keystore/debug.keystore
+          echo "Keystore restored successfully"
           keytool -list -v \
-            -keystore debug.keystore \
+            -keystore MKNotes/app/keystore/debug.keystore \
             -alias mknotes \
-            -storepass android123 \
-            -keypass android123 | grep "SHA1:"
-          echo "====== SHA-256 FINGERPRINT ======"
-          keytool -list -v \
-            -keystore debug.keystore \
-            -alias mknotes \
-            -storepass android123 \
-            -keypass android123 | grep "SHA256:"
+            -storepass ${{ secrets.KEYSTORE_PASSWORD }} \
+            -keypass ${{ secrets.KEY_PASSWORD }} | grep -E "SHA1:|SHA256:"
+
+      # ✅ Clean
+      - name: Clean Project
+        working-directory: MKNotes
+        run: gradle clean
+
+      # ✅ Build APK with stable signing
+      - name: Build Debug APK
+        working-directory: MKNotes
+        run: |
+          gradle assembleDebug \
+            -Pandroid.injected.signing.store.file=${{ github.workspace }}/MKNotes/app/keystore/debug.keystore \
+            -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=mknotes \
+            -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+
+      # ✅ Upload APK
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MKNotes-debug
+          path: MKNotes/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
