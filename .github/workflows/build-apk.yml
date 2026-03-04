@@ -18,9 +18,15 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
 
-      # ✅ Generate Debug Keystore (Same as Android default)
+      # ✅ Install Gradle manually
+      - name: Install Gradle
+        run: |
+          wget https://services.gradle.org/distributions/gradle-8.4-bin.zip
+          unzip gradle-8.4-bin.zip
+          echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
+
+      # ✅ Generate Debug Keystore
       - name: Generate Debug Keystore
         run: |
           mkdir -p $HOME/.android
@@ -34,7 +40,7 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-      # ✅ PRINT SHA-1 & SHA-256 (IMPORTANT FOR FIREBASE)
+      # ✅ Print SHA (IMPORTANT)
       - name: Print SHA Fingerprints
         run: |
           keytool -list -v \
@@ -43,12 +49,16 @@ jobs:
             -storepass android \
             -keypass android
 
-      # ✅ Make gradlew executable
+      # ✅ Generate Gradle Wrapper (Fix for missing jar)
+      - name: Generate Gradle Wrapper
+        working-directory: MKNotes
+        run: gradle wrapper --gradle-version 8.4
+
       - name: Make gradlew executable
         working-directory: MKNotes
         run: chmod +x gradlew
 
-      # ✅ Clean Build
+      # ✅ Clean Project
       - name: Clean Project
         working-directory: MKNotes
         run: ./gradlew clean
@@ -57,10 +67,8 @@ jobs:
       - name: Build Debug APK
         working-directory: MKNotes
         run: ./gradlew assembleDebug --no-daemon --stacktrace
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx2048m"
 
-      # ✅ Upload Debug APK
+      # ✅ Upload APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
