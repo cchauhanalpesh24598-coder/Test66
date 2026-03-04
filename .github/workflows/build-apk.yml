@@ -1,4 +1,4 @@
-name: Build APK Stable SHA (No Wrapper)
+name: Build APK Stable SHA (Fixed Path)
 
 on:
   push:
@@ -19,15 +19,16 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ✅ Install Gradle manually
+      # ✅ Install Gradle
       - name: Install Gradle
         run: |
           wget https://services.gradle.org/distributions/gradle-8.4-bin.zip
           unzip gradle-8.4-bin.zip
           echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
 
-      # ✅ Create Stable Debug Keystore
+      # ✅ Create Stable Debug Keystore INSIDE MKNotes
       - name: Create Stable Debug Keystore
+        working-directory: MKNotes
         run: |
           mkdir -p keystore
           if [ ! -f keystore/debug.keystore ]; then
@@ -42,8 +43,9 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      # ✅ Print SHA (Will Stay Same)
+      # ✅ Print Stable SHA
       - name: Print Stable SHA
+        working-directory: MKNotes
         run: |
           keytool -list -v \
             -keystore keystore/debug.keystore \
@@ -56,12 +58,12 @@ jobs:
         working-directory: MKNotes
         run: gradle clean
 
-      # ✅ Build Debug APK Using Stable Keystore
+      # ✅ Build Debug APK
       - name: Build Debug APK
         working-directory: MKNotes
         run: |
           gradle assembleDebug \
-            -Pandroid.injected.signing.store.file=../keystore/debug.keystore \
+            -Pandroid.injected.signing.store.file=keystore/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
             -Pandroid.injected.signing.key.password=android
