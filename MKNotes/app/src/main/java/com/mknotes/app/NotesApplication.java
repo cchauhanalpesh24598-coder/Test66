@@ -26,14 +26,11 @@ import com.mknotes.app.util.SessionManager;
  * Application class with Firebase App Check, auto-lock timer,
  * and ProcessLifecycleOwner-style foreground/background tracking.
  *
- * Firebase App Check:
- * - Debug builds: DebugAppCheckProviderFactory
- * - Release builds: PlayIntegrityAppCheckProviderFactory
- *
- * Auto-lock:
- * - When app goes to background, a 5-minute timer starts
- * - After timeout: KeyManager.lockVault() zeros DEK byte[]
- * - On foreground return after lock: user redirected to MasterPasswordActivity
+ * CHANGE LOG:
+ * - v4: loadDBKey() failure no longer calls initializeDBKey() automatically.
+ *   After Clear Data, DBK will be regenerated during vault unlock (PATH B)
+ *   when the UEK is recovered from the PK-wrapped copy in Firestore.
+ *   Premature DBK generation was causing UEK decryption failures.
  */
 public class NotesApplication extends Application {
 
@@ -62,9 +59,22 @@ public class NotesApplication extends Application {
         NotesDatabaseHelper.initSQLCipher(this);
 
         // Initialize DB key from Android Keystore (generate or load)
+        // FIX v4: Do NOT auto-generate a new DBK if loading fails.
+        // After Clear Data, the old wrapped_db_key is gone.
+        // A new DBK will be created during vault unlock PATH B (PK recovery).
+        // Creating a new DBK here would make it impossible to decrypt the
+        // existing UEK cipher (which was wrapped with the OLD DBK).
         KeyManager km = KeyManager.getInstance(this);
         if (!km.loadDBKey()) {
-            km.initializeDBKey();
+            // Only initialize a new DBK if vault is NOT initialized.
+            // If vault IS initialized (fetched from Firestore), we need to
+            // let the unlock flow handle DBK creation after UEK recovery.
+            if (!km.isVaultInitialized() && !km.hasPKWrapping()) {
+                Log.d(TAG, "No vault found, pre-generating DBK for new vault creation");
+                km.initializeDBKey();
+            } else {
+                Log.w(TAG, "DBK missing but vault exists -- will recover during unlock (PATH B)");
+            }
         }
 
         // Firebase initializes automatically via google-services.json plugin
