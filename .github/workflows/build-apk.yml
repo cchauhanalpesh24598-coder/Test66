@@ -1,4 +1,4 @@
-name: Build APK
+name: Build APK + Generate SHA
 
 on:
   push:
@@ -20,6 +20,7 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
+      # ✅ Generate Debug Keystore (Same as Android default)
       - name: Generate Debug Keystore
         run: |
           mkdir -p $HOME/.android
@@ -33,29 +34,33 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-      - name: Install Gradle and Generate Wrapper JAR
+      # ✅ PRINT SHA-1 & SHA-256 (IMPORTANT FOR FIREBASE)
+      - name: Print SHA Fingerprints
         run: |
-          mkdir -p MKNotes/gradle/wrapper
-          # Gradle install karo
-          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip -O /tmp/gradle.zip
-          unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
-          GRADLE_BIN=/tmp/gradle-dist/gradle-8.4/bin/gradle
-          chmod +x $GRADLE_BIN
-          # Wrapper JAR generate karo
-          cd MKNotes
-          $GRADLE_BIN wrapper --gradle-version 8.4
-          ls -la gradle/wrapper/
+          keytool -list -v \
+            -keystore $HOME/.android/debug.keystore \
+            -alias androiddebugkey \
+            -storepass android \
+            -keypass android
 
+      # ✅ Make gradlew executable
       - name: Make gradlew executable
         working-directory: MKNotes
         run: chmod +x gradlew
 
+      # ✅ Clean Build
+      - name: Clean Project
+        working-directory: MKNotes
+        run: ./gradlew clean
+
+      # ✅ Build Debug APK
       - name: Build Debug APK
         working-directory: MKNotes
         run: ./gradlew assembleDebug --no-daemon --stacktrace
         env:
           GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx2048m"
 
+      # ✅ Upload Debug APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
