@@ -26,26 +26,24 @@ jobs:
           unzip gradle-8.4-bin.zip
           echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
 
-      # ✅ Create Stable Debug Keystore INSIDE MKNotes
+      # ✅ Create Stable Debug Keystore INSIDE MKNotes/app/keystore
       - name: Create Stable Debug Keystore
-        working-directory: MKNotes
+        working-directory: MKNotes/app
         run: |
           mkdir -p keystore
-          if [ ! -f keystore/debug.keystore ]; then
-            keytool -genkeypair \
-              -keystore keystore/debug.keystore \
-              -storepass android \
-              -alias androiddebugkey \
-              -keypass android \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          keytool -genkeypair \
+            -keystore keystore/debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
 
       # ✅ Print Stable SHA
       - name: Print Stable SHA
-        working-directory: MKNotes
+        working-directory: MKNotes/app
         run: |
           keytool -list -v \
             -keystore keystore/debug.keystore \
@@ -63,7 +61,7 @@ jobs:
         working-directory: MKNotes
         run: |
           gradle assembleDebug \
-            -Pandroid.injected.signing.store.file=keystore/debug.keystore \
+            -Pandroid.injected.signing.store.file=${{ github.workspace }}/MKNotes/app/keystore/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
             -Pandroid.injected.signing.key.password=android
