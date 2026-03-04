@@ -1,4 +1,4 @@
-name: Build APK Stable SHA
+name: Build APK Stable SHA (No Wrapper)
 
 on:
   push:
@@ -19,13 +19,20 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ✅ Create FIXED Debug Keystore Only If Not Exists
+      # ✅ Install Gradle manually
+      - name: Install Gradle
+        run: |
+          wget https://services.gradle.org/distributions/gradle-8.4-bin.zip
+          unzip gradle-8.4-bin.zip
+          echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
+
+      # ✅ Create Stable Debug Keystore
       - name: Create Stable Debug Keystore
         run: |
-          mkdir -p app/keystore
-          if [ ! -f app/keystore/debug.keystore ]; then
+          mkdir -p keystore
+          if [ ! -f keystore/debug.keystore ]; then
             keytool -genkeypair \
-              -keystore app/keystore/debug.keystore \
+              -keystore keystore/debug.keystore \
               -storepass android \
               -alias androiddebugkey \
               -keypass android \
@@ -35,28 +42,26 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      # ✅ Print SHA (Now It Will Always Be Same)
+      # ✅ Print SHA (Will Stay Same)
       - name: Print Stable SHA
         run: |
           keytool -list -v \
-            -keystore app/keystore/debug.keystore \
+            -keystore keystore/debug.keystore \
             -alias androiddebugkey \
             -storepass android \
             -keypass android
 
-      - name: Make gradlew executable
-        working-directory: MKNotes
-        run: chmod +x gradlew
-
+      # ✅ Clean Project
       - name: Clean Project
         working-directory: MKNotes
-        run: ./gradlew clean
+        run: gradle clean
 
-      - name: Build Debug APK Using Stable Keystore
+      # ✅ Build Debug APK Using Stable Keystore
+      - name: Build Debug APK
         working-directory: MKNotes
         run: |
-          ./gradlew assembleDebug \
-            -Pandroid.injected.signing.store.file=../app/keystore/debug.keystore \
+          gradle assembleDebug \
+            -Pandroid.injected.signing.store.file=../keystore/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
             -Pandroid.injected.signing.key.password=android
