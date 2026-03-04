@@ -18,34 +18,46 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Singleton managing the 3-layer key hierarchy (Notesnook-equivalent).
+ * Singleton managing the key hierarchy (Notesnook-equivalent, FIXED).
  *
- * Key Hierarchy:
+ * NEW Key Hierarchy (Clear-Data Resistant):
+ *
  *   Layer 1: User Password
- *     -> (Argon2id KDF) -> User Encryption Key (UEK) - 256-bit
- *     -> UEK encrypted with DB Key via XChaCha20-Poly1305
- *     -> Stored as "userKeyCipher" in SharedPreferences + Firestore
+ *     -> (Argon2id KDF) -> Password Key (PK) - 256-bit
+ *     -> PK encrypts RANDOM UEK via XChaCha20-Poly1305
+ *     -> Stored as "encUEK_PK" + "iv_PK" in Firestore + local prefs
+ *     -> THIS IS THE RECOVERY PATH (survives Clear Data)
  *
  *   Layer 2: Database Key (DBK) - 256-bit
- *     -> Random, generated once
+ *     -> Random, generated once per device
  *     -> Wrapped with Android Keystore AES-256-GCM master key
  *     -> Stored as encrypted blob in SharedPreferences
- *     -> Used as: SQLCipher DB passphrase + XChaCha20-Poly1305 wrapping key
+ *     -> Used as: SQLCipher DB passphrase
+ *     -> ALSO wraps UEK for fast local unlock (no Argon2 needed)
+ *     -> Stored as "encUEK_DBK" + "iv_DBK" in local prefs only
  *
  *   Layer 3: Android Keystore hardware-backed AES key
  *     -> Never leaves secure hardware (TEE/StrongBox)
  *     -> Used ONLY to wrap/unwrap DB key
  *
+ *   UEK (User Encryption Key) - 256-bit RANDOM
+ *     -> Generated ONCE at vault creation (NEVER derived from password)
+ *     -> This key encrypts/decrypts all note data
+ *     -> Wrapped by BOTH PK (for recovery) and DBK (for fast unlock)
+ *
  * Firestore document path: users/{uid}/crypto_metadata/vault
- * Fields: salt (Base64), userKeyCipher (Base64), userKeyIV (Base64),
+ * Fields: salt (Base64), encUEK_PK (Base64), iv_PK (Base64),
  *         algorithm ("xcha-argon2id13"), createdAt (long millis)
  *
- * RULES:
- * - DB key is device-local (wrapped by Keystore, never leaves device)
- * - UEK cipher is synced to Firestore for cross-device support
- * - Salt is stored both locally and in Firestore
- * - On reinstall: fetch UEK cipher + salt from Firestore, unwrap DB key from Keystore,
- *   derive UEK from password, use UEK for data operations
+ * RECOVERY AFTER CLEAR DATA:
+ * 1. Login Firebase -> fetch vault from Firestore
+ * 2. Vault has: salt, encUEK_PK, iv_PK
+ * 3. User enters master password
+ * 4. Derive PK from password + salt via Argon2id
+ * 5. Decrypt UEK using PK -> SUCCESS (no DBK needed!)
+ * 6. Generate NEW DBK, wrap with Keystore, store locally
+ * 7. Re-wrap UEK with new DBK for local fast-unlock
+ * 8. Notes decrypt normally with recovered UEK
  */
 public class KeyManager {
 
@@ -53,17 +65,32 @@ public class KeyManager {
 
     // Local SharedPreferences keys
     private static final String PREFS_NAME = "mknotes_vault_v3";
+
+    // Password-Key wrapped UEK (stored in Firestore + local prefs)
     private static final String KEY_SALT = "vault_salt_b64";
-    private static final String KEY_USER_KEY_CIPHER = "user_key_cipher_b64";
-    private static final String KEY_USER_KEY_IV = "user_key_iv_b64";
+    private static final String KEY_ENC_UEK_PK = "enc_uek_pk_b64";        // UEK encrypted with Password Key
+    private static final String KEY_IV_PK = "iv_pk_b64";                    // Nonce for PK wrapping
+
+    // DBK-wrapped UEK (stored in local prefs ONLY)
+    private static final String KEY_ENC_UEK_DBK = "user_key_cipher_b64";   // UEK encrypted with DBK (backward compat name)
+    private static final String KEY_IV_DBK = "user_key_iv_b64";            // Nonce for DBK wrapping (backward compat name)
+
+    // DB Key wrapped by Keystore
     private static final String KEY_WRAPPED_DB_KEY = "wrapped_db_key";
+
+    // Metadata
     private static final String KEY_ALGORITHM = "vault_algorithm";
     private static final String KEY_CREATED_AT = "vault_created_at";
     private static final String KEY_VAULT_INITIALIZED = "vault_initialized";
     private static final String KEY_VAULT_UPLOADED = "vault_uploaded_to_firestore";
+    private static final String KEY_HAS_PK_WRAPPING = "has_pk_wrapping";   // NEW: flag for PK wrapping
 
     // Old vault prefs name for migration detection
     private static final String OLD_PREFS_NAME = "mknotes_vault_v2";
+
+    // Legacy key names (for reading old data during migration)
+    private static final String LEGACY_KEY_USER_KEY_CIPHER = "user_key_cipher_b64";
+    private static final String LEGACY_KEY_USER_KEY_IV = "user_key_iv_b64";
 
     public static final int CURRENT_VAULT_VERSION = 3;
 
@@ -102,13 +129,46 @@ public class KeyManager {
     // ======================== STATE CHECKS ========================
 
     /**
-     * Check if new vault (v3) metadata exists locally.
+     * Check if vault metadata exists locally.
+     * Supports both old format (only DBK wrapping) and new format (PK wrapping).
      */
     public boolean isVaultInitialized() {
-        return prefs.getBoolean(KEY_VAULT_INITIALIZED, false)
-                && prefs.getString(KEY_SALT, null) != null
-                && prefs.getString(KEY_USER_KEY_CIPHER, null) != null
-                && prefs.getString(KEY_USER_KEY_IV, null) != null
+        boolean hasBasicVault = prefs.getBoolean(KEY_VAULT_INITIALIZED, false)
+                && prefs.getString(KEY_SALT, null) != null;
+
+        if (!hasBasicVault) return false;
+
+        // New format: has PK wrapping
+        if (prefs.getString(KEY_ENC_UEK_PK, null) != null
+                && prefs.getString(KEY_IV_PK, null) != null) {
+            return true;
+        }
+
+        // Old format: only DBK wrapping (backward compat)
+        if (prefs.getString(KEY_ENC_UEK_DBK, null) != null
+                && prefs.getString(KEY_IV_DBK, null) != null
+                && prefs.getString(KEY_WRAPPED_DB_KEY, null) != null) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if vault has PK (password-key) wrapping -- the recovery-capable format.
+     */
+    public boolean hasPKWrapping() {
+        return prefs.getString(KEY_ENC_UEK_PK, null) != null
+                && prefs.getString(KEY_IV_PK, null) != null
+                && prefs.getString(KEY_SALT, null) != null;
+    }
+
+    /**
+     * Check if vault has DBK wrapping (device-local fast unlock).
+     */
+    public boolean hasDBKWrapping() {
+        return prefs.getString(KEY_ENC_UEK_DBK, null) != null
+                && prefs.getString(KEY_IV_DBK, null) != null
                 && prefs.getString(KEY_WRAPPED_DB_KEY, null) != null;
     }
 
@@ -163,7 +223,7 @@ public class KeyManager {
     /**
      * Initialize the Database Key (Layer 2).
      * Generates random 256-bit key, wraps with Android Keystore, stores wrapped blob.
-     * Called once during first vault creation.
+     * Called once during first vault creation OR after Clear Data recovery.
      *
      * @return true if DB key was created or already exists
      */
@@ -259,18 +319,19 @@ public class KeyManager {
         return copy;
     }
 
-    // ======================== VAULT CREATION ========================
+    // ======================== VAULT CREATION (NEW) ========================
 
     /**
-     * First-time vault setup with 3-layer key hierarchy.
+     * First-time vault setup with Clear-Data-Resistant key hierarchy.
      *
-     * 1. Initialize DB key (generate + wrap with Keystore)
-     * 2. Generate 16-byte random salt
-     * 3. Derive UEK from password via Argon2id
-     * 4. Encrypt UEK with DB key via XChaCha20-Poly1305
-     * 5. Store vault metadata locally
-     * 6. Upload to Firestore
-     * 7. Cache UEK in memory
+     * 1. Generate RANDOM UEK (User Encryption Key) -- 256-bit
+     * 2. Initialize DB key (generate + wrap with Keystore)
+     * 3. Generate 16-byte random salt
+     * 4. Derive PK (Password Key) from password via Argon2id
+     * 5. Wrap UEK with PK via XChaCha20-Poly1305 --> encUEK_PK + iv_PK (RECOVERY PATH)
+     * 6. Wrap UEK with DBK via XChaCha20-Poly1305 --> encUEK_DBK + iv_DBK (FAST LOCAL UNLOCK)
+     * 7. Store vault metadata locally + upload to Firestore
+     * 8. Cache UEK in memory
      *
      * @param password user's chosen master password
      * @param callback called on completion
@@ -292,9 +353,14 @@ public class KeyManager {
             public void run() {
                 byte[] uek = null;
                 byte[] dbKey = null;
+                byte[] pk = null;
 
                 try {
-                    // Step 1: Initialize DB key
+                    // Step 1: Generate RANDOM UEK
+                    uek = CryptoManager.generateDEK();
+                    Log.d(TAG, "[VAULT_CREATED] Random UEK generated");
+
+                    // Step 2: Initialize DB key
                     if (!initializeDBKey()) {
                         if (callback != null) callback.onError("DB key initialization failed");
                         return;
@@ -306,53 +372,69 @@ public class KeyManager {
                         return;
                     }
 
-                    // Step 2: Generate salt
+                    // Step 3: Generate salt
                     byte[] salt = CryptoManager.generateSalt();
 
-                    // Step 3: Derive UEK from password via Argon2id
-                    uek = CryptoManager.deriveKeyArgon2(password, salt);
-                    if (uek == null) {
+                    // Step 4: Derive PK from password via Argon2id
+                    pk = CryptoManager.deriveKeyArgon2(password, salt);
+                    if (pk == null) {
                         Log.e(TAG, "[VAULT_CREATED] FAILED: Argon2id derivation returned null");
                         if (callback != null) callback.onError("Key derivation failed");
                         return;
                     }
 
-                    // Step 4: Encrypt UEK with DB key
-                    CryptoManager.VaultBundle bundle = CryptoManager.encryptDEK(uek, dbKey);
+                    // Step 5: Wrap UEK with PK (RECOVERY PATH - stored in Firestore)
+                    CryptoManager.VaultBundle pkBundle = CryptoManager.encryptDEK(uek, pk);
+                    CryptoManager.zeroFill(pk);
+                    pk = null;
+
+                    if (pkBundle == null) {
+                        Log.e(TAG, "[VAULT_CREATED] FAILED: UEK-PK encryption failed");
+                        if (callback != null) callback.onError("UEK-PK encryption failed");
+                        return;
+                    }
+
+                    // Step 6: Wrap UEK with DBK (FAST LOCAL UNLOCK)
+                    CryptoManager.VaultBundle dbkBundle = CryptoManager.encryptDEK(uek, dbKey);
                     CryptoManager.zeroFill(dbKey);
                     dbKey = null;
 
-                    if (bundle == null) {
-                        Log.e(TAG, "[VAULT_CREATED] FAILED: UEK encryption failed");
-                        if (callback != null) callback.onError("UEK encryption failed");
+                    if (dbkBundle == null) {
+                        Log.e(TAG, "[VAULT_CREATED] FAILED: UEK-DBK encryption failed");
+                        if (callback != null) callback.onError("UEK-DBK encryption failed");
                         return;
                     }
 
                     final String saltB64 = Base64.encodeToString(salt, Base64.NO_WRAP);
-                    final String userKeyCipherB64 = bundle.encryptedDEK;
-                    final String userKeyIVB64 = bundle.iv;
+                    final String encUEK_PK_B64 = pkBundle.encryptedDEK;
+                    final String iv_PK_B64 = pkBundle.iv;
+                    final String encUEK_DBK_B64 = dbkBundle.encryptedDEK;
+                    final String iv_DBK_B64 = dbkBundle.iv;
                     final long createdAt = System.currentTimeMillis();
 
-                    // Step 5: Store locally first
+                    // Step 7: Store locally
                     prefs.edit()
                             .putString(KEY_SALT, saltB64)
-                            .putString(KEY_USER_KEY_CIPHER, userKeyCipherB64)
-                            .putString(KEY_USER_KEY_IV, userKeyIVB64)
+                            .putString(KEY_ENC_UEK_PK, encUEK_PK_B64)
+                            .putString(KEY_IV_PK, iv_PK_B64)
+                            .putString(KEY_ENC_UEK_DBK, encUEK_DBK_B64)
+                            .putString(KEY_IV_DBK, iv_DBK_B64)
                             .putString(KEY_ALGORITHM, CryptoManager.ALG_IDENTIFIER)
                             .putLong(KEY_CREATED_AT, createdAt)
                             .putBoolean(KEY_VAULT_INITIALIZED, true)
                             .putBoolean(KEY_VAULT_UPLOADED, false)
+                            .putBoolean(KEY_HAS_PK_WRAPPING, true)
                             .commit();
 
-                    // Step 7: Cache UEK in memory
+                    // Step 8: Cache UEK in memory
                     cachedUEK = uek;
                     uek = null; // Prevent zeroFill in finally
 
                     Log.d(TAG, "[VAULT_CREATED] Vault stored locally, uploading to Firestore...");
 
-                    // Step 6: Upload to Firestore
-                    uploadVaultToFirestoreWithConfirmation(saltB64, userKeyCipherB64,
-                            userKeyIVB64, createdAt);
+                    // Upload to Firestore (PK-wrapped UEK + salt)
+                    uploadVaultToFirestoreWithConfirmation(saltB64, encUEK_PK_B64,
+                            iv_PK_B64, createdAt);
 
                     if (callback != null) callback.onSuccess();
 
@@ -362,6 +444,7 @@ public class KeyManager {
                 } finally {
                     CryptoManager.zeroFill(uek);
                     CryptoManager.zeroFill(dbKey);
+                    CryptoManager.zeroFill(pk);
                 }
             }
         }).start();
@@ -376,41 +459,54 @@ public class KeyManager {
 
         byte[] uek = null;
         byte[] dbKey = null;
+        byte[] pk = null;
 
         try {
+            // Generate RANDOM UEK
+            uek = CryptoManager.generateDEK();
+
             if (!initializeDBKey()) return false;
 
             dbKey = getDBKey();
             if (dbKey == null) return false;
 
             byte[] salt = CryptoManager.generateSalt();
-            uek = CryptoManager.deriveKeyArgon2(password, salt);
-            if (uek == null) return false;
+            pk = CryptoManager.deriveKeyArgon2(password, salt);
+            if (pk == null) return false;
 
-            CryptoManager.VaultBundle bundle = CryptoManager.encryptDEK(uek, dbKey);
+            // Wrap UEK with PK (recovery path)
+            CryptoManager.VaultBundle pkBundle = CryptoManager.encryptDEK(uek, pk);
+            CryptoManager.zeroFill(pk);
+            pk = null;
+            if (pkBundle == null) return false;
+
+            // Wrap UEK with DBK (fast local unlock)
+            CryptoManager.VaultBundle dbkBundle = CryptoManager.encryptDEK(uek, dbKey);
             CryptoManager.zeroFill(dbKey);
             dbKey = null;
-
-            if (bundle == null) return false;
+            if (dbkBundle == null) return false;
 
             String saltB64 = Base64.encodeToString(salt, Base64.NO_WRAP);
             long createdAt = System.currentTimeMillis();
 
             prefs.edit()
                     .putString(KEY_SALT, saltB64)
-                    .putString(KEY_USER_KEY_CIPHER, bundle.encryptedDEK)
-                    .putString(KEY_USER_KEY_IV, bundle.iv)
+                    .putString(KEY_ENC_UEK_PK, pkBundle.encryptedDEK)
+                    .putString(KEY_IV_PK, pkBundle.iv)
+                    .putString(KEY_ENC_UEK_DBK, dbkBundle.encryptedDEK)
+                    .putString(KEY_IV_DBK, dbkBundle.iv)
                     .putString(KEY_ALGORITHM, CryptoManager.ALG_IDENTIFIER)
                     .putLong(KEY_CREATED_AT, createdAt)
                     .putBoolean(KEY_VAULT_INITIALIZED, true)
                     .putBoolean(KEY_VAULT_UPLOADED, false)
+                    .putBoolean(KEY_HAS_PK_WRAPPING, true)
                     .commit();
 
             cachedUEK = uek;
             uek = null;
 
-            uploadVaultToFirestoreWithConfirmation(saltB64, bundle.encryptedDEK,
-                    bundle.iv, createdAt);
+            uploadVaultToFirestoreWithConfirmation(saltB64, pkBundle.encryptedDEK,
+                    pkBundle.iv, createdAt);
 
             return true;
         } catch (Exception e) {
@@ -419,14 +515,27 @@ public class KeyManager {
         } finally {
             CryptoManager.zeroFill(uek);
             CryptoManager.zeroFill(dbKey);
+            CryptoManager.zeroFill(pk);
         }
     }
 
-    // ======================== VAULT UNLOCK ========================
+    // ======================== VAULT UNLOCK (NEW - DUAL PATH) ========================
 
     /**
-     * Unlock vault: derive UEK from password + stored salt via Argon2id.
-     * Then verify by decrypting the stored UEK cipher.
+     * Unlock vault with DUAL-PATH strategy:
+     *
+     * PATH A (Fast - Device Local):
+     *   If DBK wrapping exists (wrapped_db_key + encUEK_DBK):
+     *   1. Load DBK from Keystore
+     *   2. Decrypt UEK from encUEK_DBK using DBK
+     *   3. Verify by deriving PK from password, comparing with PK-decrypted UEK
+     *
+     * PATH B (Recovery - After Clear Data):
+     *   If DBK wrapping MISSING but PK wrapping exists (encUEK_PK from Firestore):
+     *   1. Derive PK from password + salt via Argon2id
+     *   2. Decrypt UEK from encUEK_PK using PK
+     *   3. If success: UEK recovered!
+     *   4. Generate new DBK, re-wrap UEK with new DBK for future fast unlocks
      *
      * @param password user's master password
      * @return true if password correct and UEK cached
@@ -438,74 +547,256 @@ public class KeyManager {
             return false;
         }
 
-        byte[] derivedUEK = null;
+        // Try PATH A first (fast local unlock via DBK)
+        if (hasDBKWrapping()) {
+            Log.d(TAG, "[VAULT_UNLOCK] Trying PATH A: DBK-based local unlock");
+            boolean resultA = unlockViaDBK(password);
+            if (resultA) {
+                // Also upgrade to PK wrapping if not already done
+                upgradeToPKWrappingIfNeeded(password);
+                return true;
+            }
+            Log.w(TAG, "[VAULT_UNLOCK] PATH A failed, trying PATH B");
+        }
+
+        // PATH B: Recovery via PK (Password Key) wrapping
+        if (hasPKWrapping()) {
+            Log.d(TAG, "[VAULT_UNLOCK] Trying PATH B: PK-based recovery unlock");
+            return unlockViaPK(password);
+        }
+
+        Log.e(TAG, "[VAULT_UNLOCK_FAILED] No valid unlock path available");
+        return false;
+    }
+
+    /**
+     * PATH A: Fast local unlock using DBK.
+     */
+    private boolean unlockViaDBK(String password) {
+        byte[] derivedPK = null;
         byte[] dbKey = null;
 
         try {
+            String encUEK_DBK_B64 = prefs.getString(KEY_ENC_UEK_DBK, null);
+            String iv_DBK_B64 = prefs.getString(KEY_IV_DBK, null);
             String saltB64 = prefs.getString(KEY_SALT, null);
-            String userKeyCipherB64 = prefs.getString(KEY_USER_KEY_CIPHER, null);
-            String userKeyIVB64 = prefs.getString(KEY_USER_KEY_IV, null);
 
-            if (saltB64 == null || userKeyCipherB64 == null || userKeyIVB64 == null) {
-                Log.e(TAG, "[VAULT_UNLOCK_FAILED] incomplete local vault metadata");
+            if (encUEK_DBK_B64 == null || iv_DBK_B64 == null || saltB64 == null) {
                 return false;
             }
 
             // Load DB key from Keystore
             if (!loadDBKey()) {
-                Log.e(TAG, "[VAULT_UNLOCK_FAILED] DB key not available");
+                Log.e(TAG, "[PATH_A] DB key not available");
                 return false;
             }
             dbKey = getDBKey();
 
-            byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
-
-            Log.d(TAG, "[VAULT_FETCH] Unlocking with Argon2id, salt_len=" + salt.length);
-
-            // Derive UEK from password
-            derivedUEK = CryptoManager.deriveKeyArgon2(password, salt);
-            if (derivedUEK == null) {
-                Log.e(TAG, "[VAULT_UNLOCK_FAILED] Argon2id derivation returned null");
-                return false;
-            }
-
-            // Verify: decrypt the stored UEK cipher with DB key
-            // If the derivation produced the correct UEK, the encrypted version
-            // should match what we can decrypt from the stored cipher
-            byte[] storedUEK = CryptoManager.decryptDEK(userKeyCipherB64, userKeyIVB64, "", dbKey);
+            // Decrypt UEK using DBK
+            byte[] storedUEK = CryptoManager.decryptDEK(encUEK_DBK_B64, iv_DBK_B64, "", dbKey);
             CryptoManager.zeroFill(dbKey);
             dbKey = null;
 
             if (storedUEK == null) {
-                Log.w(TAG, "[VAULT_UNLOCK_FAILED] UEK cipher decryption failed");
-                CryptoManager.zeroFill(derivedUEK);
+                Log.w(TAG, "[PATH_A] UEK-DBK decryption failed");
                 return false;
             }
 
-            // Compare derived UEK with stored UEK
-            if (!constantTimeEquals(derivedUEK, storedUEK)) {
-                Log.w(TAG, "[VAULT_UNLOCK_FAILED] derived UEK doesn't match stored UEK -- wrong password");
-                CryptoManager.zeroFill(derivedUEK);
-                CryptoManager.zeroFill(storedUEK);
-                return false;
-            }
+            // Now verify the password is correct
+            // If we have PK wrapping, use that to verify
+            if (hasPKWrapping()) {
+                byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
+                derivedPK = CryptoManager.deriveKeyArgon2(password, salt);
+                if (derivedPK == null) {
+                    CryptoManager.zeroFill(storedUEK);
+                    return false;
+                }
 
-            CryptoManager.zeroFill(storedUEK);
+                String encUEK_PK_B64 = prefs.getString(KEY_ENC_UEK_PK, null);
+                String iv_PK_B64 = prefs.getString(KEY_IV_PK, null);
+
+                byte[] pkDecryptedUEK = CryptoManager.decryptDEK(encUEK_PK_B64, iv_PK_B64, "", derivedPK);
+                CryptoManager.zeroFill(derivedPK);
+                derivedPK = null;
+
+                if (pkDecryptedUEK == null) {
+                    Log.w(TAG, "[PATH_A] Password verification via PK failed -- wrong password");
+                    CryptoManager.zeroFill(storedUEK);
+                    return false;
+                }
+
+                if (!constantTimeEquals(storedUEK, pkDecryptedUEK)) {
+                    Log.w(TAG, "[PATH_A] UEK mismatch between DBK and PK paths -- data corruption?");
+                    CryptoManager.zeroFill(storedUEK);
+                    CryptoManager.zeroFill(pkDecryptedUEK);
+                    return false;
+                }
+                CryptoManager.zeroFill(pkDecryptedUEK);
+            } else {
+                // LEGACY: Old format without PK wrapping -- use old verification
+                // Derive key from password and compare with DBK-decrypted UEK
+                byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
+                derivedPK = CryptoManager.deriveKeyArgon2(password, salt);
+                if (derivedPK == null) {
+                    CryptoManager.zeroFill(storedUEK);
+                    return false;
+                }
+
+                // In the OLD system, UEK WAS the derived key (not random)
+                // So comparing derived == stored was the verification
+                if (!constantTimeEquals(derivedPK, storedUEK)) {
+                    Log.w(TAG, "[PATH_A_LEGACY] derived key doesn't match stored UEK -- wrong password");
+                    CryptoManager.zeroFill(derivedPK);
+                    CryptoManager.zeroFill(storedUEK);
+                    return false;
+                }
+                CryptoManager.zeroFill(derivedPK);
+                derivedPK = null;
+            }
 
             // Cache UEK
-            cachedUEK = derivedUEK;
-            derivedUEK = null;
-
-            Log.d(TAG, "[VAULT_UNLOCK_SUCCESS] UEK derived and verified, cached");
+            cachedUEK = storedUEK;
+            Log.d(TAG, "[PATH_A] Vault unlocked via DBK, UEK cached");
             return true;
 
         } catch (Exception e) {
-            Log.e(TAG, "[VAULT_UNLOCK_FAILED] exception: " + e.getMessage());
-            CryptoManager.zeroFill(derivedUEK);
+            Log.e(TAG, "[PATH_A] exception: " + e.getMessage());
+            CryptoManager.zeroFill(derivedPK);
             return false;
         } finally {
             CryptoManager.zeroFill(dbKey);
         }
+    }
+
+    /**
+     * PATH B: Recovery unlock using Password Key (PK).
+     * Used after Clear Data when DBK is lost but Firestore has PK-wrapped UEK.
+     */
+    private boolean unlockViaPK(String password) {
+        byte[] pk = null;
+        byte[] dbKey = null;
+
+        try {
+            String saltB64 = prefs.getString(KEY_SALT, null);
+            String encUEK_PK_B64 = prefs.getString(KEY_ENC_UEK_PK, null);
+            String iv_PK_B64 = prefs.getString(KEY_IV_PK, null);
+
+            if (saltB64 == null || encUEK_PK_B64 == null || iv_PK_B64 == null) {
+                Log.e(TAG, "[PATH_B] Incomplete PK vault metadata");
+                return false;
+            }
+
+            byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
+
+            Log.d(TAG, "[PATH_B] Deriving PK with Argon2id, salt_len=" + salt.length);
+
+            // Step 1: Derive PK from password
+            pk = CryptoManager.deriveKeyArgon2(password, salt);
+            if (pk == null) {
+                Log.e(TAG, "[PATH_B] Argon2id derivation returned null");
+                return false;
+            }
+
+            // Step 2: Decrypt UEK using PK
+            byte[] recoveredUEK = CryptoManager.decryptDEK(encUEK_PK_B64, iv_PK_B64, "", pk);
+            CryptoManager.zeroFill(pk);
+            pk = null;
+
+            if (recoveredUEK == null) {
+                Log.w(TAG, "[PATH_B] UEK-PK decryption failed -- wrong password");
+                return false;
+            }
+
+            Log.d(TAG, "[PATH_B] UEK recovered from PK wrapping!");
+
+            // Step 3: Generate new DBK for this device
+            // First clear any stale DBK data
+            prefs.edit().remove(KEY_WRAPPED_DB_KEY).commit();
+            cachedDBKey = null;
+
+            if (initializeDBKey()) {
+                dbKey = getDBKey();
+                if (dbKey != null) {
+                    // Step 4: Re-wrap UEK with new DBK for future fast unlocks
+                    CryptoManager.VaultBundle dbkBundle = CryptoManager.encryptDEK(recoveredUEK, dbKey);
+                    CryptoManager.zeroFill(dbKey);
+                    dbKey = null;
+
+                    if (dbkBundle != null) {
+                        prefs.edit()
+                                .putString(KEY_ENC_UEK_DBK, dbkBundle.encryptedDEK)
+                                .putString(KEY_IV_DBK, dbkBundle.iv)
+                                .commit();
+                        Log.d(TAG, "[PATH_B] UEK re-wrapped with new DBK for fast unlock");
+                    }
+                }
+            }
+
+            // Cache UEK
+            cachedUEK = recoveredUEK;
+            Log.d(TAG, "[PATH_B] Vault unlocked via PK recovery, UEK cached");
+            return true;
+
+        } catch (Exception e) {
+            Log.e(TAG, "[PATH_B] exception: " + e.getMessage());
+            CryptoManager.zeroFill(pk);
+            return false;
+        } finally {
+            CryptoManager.zeroFill(dbKey);
+        }
+    }
+
+    /**
+     * Upgrade existing vault to PK wrapping if not already done.
+     * Called after successful PATH A unlock to add recovery capability.
+     */
+    private void upgradeToPKWrappingIfNeeded(final String password) {
+        if (hasPKWrapping()) return;
+        if (cachedUEK == null) return;
+
+        Log.d(TAG, "[UPGRADE] Adding PK wrapping to vault...");
+
+        new Thread(new Runnable() {
+            public void run() {
+                byte[] pk = null;
+                try {
+                    String saltB64 = prefs.getString(KEY_SALT, null);
+                    if (saltB64 == null) return;
+
+                    byte[] salt = Base64.decode(saltB64, Base64.NO_WRAP);
+                    pk = CryptoManager.deriveKeyArgon2(password, salt);
+                    if (pk == null) return;
+
+                    byte[] uekCopy = getDEK();
+                    if (uekCopy == null) return;
+
+                    CryptoManager.VaultBundle pkBundle = CryptoManager.encryptDEK(uekCopy, pk);
+                    CryptoManager.zeroFill(uekCopy);
+                    CryptoManager.zeroFill(pk);
+                    pk = null;
+
+                    if (pkBundle == null) return;
+
+                    prefs.edit()
+                            .putString(KEY_ENC_UEK_PK, pkBundle.encryptedDEK)
+                            .putString(KEY_IV_PK, pkBundle.iv)
+                            .putBoolean(KEY_HAS_PK_WRAPPING, true)
+                            .putBoolean(KEY_VAULT_UPLOADED, false)
+                            .commit();
+
+                    Log.d(TAG, "[UPGRADE] PK wrapping added, uploading to Firestore...");
+
+                    // Upload the PK-wrapped vault to Firestore
+                    long createdAt = prefs.getLong(KEY_CREATED_AT, System.currentTimeMillis());
+                    uploadVaultToFirestoreWithConfirmation(saltB64, pkBundle.encryptedDEK,
+                            pkBundle.iv, createdAt);
+
+                } catch (Exception e) {
+                    Log.e(TAG, "[UPGRADE] Failed: " + e.getMessage());
+                    CryptoManager.zeroFill(pk);
+                }
+            }
+        }).start();
     }
 
     // ======================== VAULT LOCK ========================
@@ -522,14 +813,11 @@ public class KeyManager {
         Log.d(TAG, "Vault locked, UEK zeroed");
     }
 
-    // ======================== DEK ACCESS (UEK is the new DEK) ========================
+    // ======================== DEK ACCESS (UEK is the DEK) ========================
 
     /**
      * Get a COPY of the cached UEK. Caller must zero their copy when done.
      * Returns null if vault is locked.
-     *
-     * NOTE: For API compatibility, this method is named getDEK() but returns UEK.
-     * In the new architecture, UEK is the data encryption key.
      */
     public byte[] getDEK() {
         if (cachedUEK == null) return null;
@@ -548,10 +836,11 @@ public class KeyManager {
 
     /**
      * Upload vault metadata to Firestore with upload confirmation tracking.
+     * NOW uploads PK-wrapped UEK (recovery capable) instead of DBK-wrapped.
      */
     private void uploadVaultToFirestoreWithConfirmation(final String saltB64,
-                                                         final String userKeyCipherB64,
-                                                         final String userKeyIVB64,
+                                                         final String encUEK_PK_B64,
+                                                         final String iv_PK_B64,
                                                          final long createdAt) {
         FirebaseAuthManager authManager = FirebaseAuthManager.getInstance(appContext);
         if (!authManager.isLoggedIn()) {
@@ -568,13 +857,17 @@ public class KeyManager {
 
         Map<String, Object> data = new HashMap<>();
         data.put("salt", saltB64);
-        data.put("userKeyCipher", userKeyCipherB64);
-        data.put("userKeyIV", userKeyIVB64);
+        data.put("encUEK_PK", encUEK_PK_B64);     // NEW: PK-wrapped UEK
+        data.put("iv_PK", iv_PK_B64);               // NEW: PK nonce
         data.put("algorithm", CryptoManager.ALG_IDENTIFIER);
         data.put("createdAt", createdAt);
+        data.put("vaultVersion", 4);                 // NEW: version marker
+
         // Keep old fields for backward compat detection
-        data.put("encryptedDEK", userKeyCipherB64);
-        data.put("iv", userKeyIVB64);
+        data.put("userKeyCipher", encUEK_PK_B64);
+        data.put("userKeyIV", iv_PK_B64);
+        data.put("encryptedDEK", encUEK_PK_B64);
+        data.put("iv", iv_PK_B64);
         data.put("tag", "");
         data.put("iterations", 0);
 
@@ -599,24 +892,37 @@ public class KeyManager {
         String uid = authManager.getUid();
         if (uid == null) return;
 
+        // Prefer PK wrapping for upload
         String saltB64 = prefs.getString(KEY_SALT, "");
-        String userKeyCipherB64 = prefs.getString(KEY_USER_KEY_CIPHER, "");
-        String userKeyIVB64 = prefs.getString(KEY_USER_KEY_IV, "");
-        long createdAt = prefs.getLong(KEY_CREATED_AT, System.currentTimeMillis());
+        String encUEK_PK_B64 = prefs.getString(KEY_ENC_UEK_PK, "");
+        String iv_PK_B64 = prefs.getString(KEY_IV_PK, "");
 
-        if (saltB64.isEmpty() || userKeyCipherB64.isEmpty() || userKeyIVB64.isEmpty()) {
+        // Fallback to old DBK wrapping names if PK not available
+        if (encUEK_PK_B64.isEmpty()) {
+            encUEK_PK_B64 = prefs.getString(KEY_ENC_UEK_DBK, "");
+        }
+        if (iv_PK_B64.isEmpty()) {
+            iv_PK_B64 = prefs.getString(KEY_IV_DBK, "");
+        }
+
+        if (saltB64.isEmpty() || encUEK_PK_B64.isEmpty() || iv_PK_B64.isEmpty()) {
             Log.e(TAG, "uploadVaultToFirestore: incomplete local data");
             return;
         }
 
+        long createdAt = prefs.getLong(KEY_CREATED_AT, System.currentTimeMillis());
+
         Map<String, Object> data = new HashMap<>();
         data.put("salt", saltB64);
-        data.put("userKeyCipher", userKeyCipherB64);
-        data.put("userKeyIV", userKeyIVB64);
+        data.put("encUEK_PK", encUEK_PK_B64);
+        data.put("iv_PK", iv_PK_B64);
         data.put("algorithm", CryptoManager.ALG_IDENTIFIER);
         data.put("createdAt", createdAt);
-        data.put("encryptedDEK", userKeyCipherB64);
-        data.put("iv", userKeyIVB64);
+        data.put("vaultVersion", 4);
+        data.put("userKeyCipher", encUEK_PK_B64);
+        data.put("userKeyIV", iv_PK_B64);
+        data.put("encryptedDEK", encUEK_PK_B64);
+        data.put("iv", iv_PK_B64);
         data.put("tag", "");
         data.put("iterations", 0);
 
@@ -642,6 +948,7 @@ public class KeyManager {
 
     /**
      * Fetch vault from Firestore (3-state result).
+     * NOW reads both new PK fields and old fields for backward compat.
      */
     public void fetchVaultFromFirestoreWithResult(final VaultFetchResultCallback callback) {
         FirebaseAuthManager authManager = FirebaseAuthManager.getInstance(appContext);
@@ -693,6 +1000,7 @@ public class KeyManager {
 
     /**
      * Process Firestore vault document and store locally.
+     * Reads BOTH new PK fields and old fields.
      */
     private boolean processVaultDocument(DocumentSnapshot doc) {
         if (doc == null || !doc.exists()) return false;
@@ -703,30 +1011,42 @@ public class KeyManager {
         String salt = getStr(data, "salt");
         String algorithm = getStr(data, "algorithm");
 
-        // New v3 format
-        String userKeyCipher = getStr(data, "userKeyCipher");
-        String userKeyIV = getStr(data, "userKeyIV");
+        // NEW v4 format fields
+        String encUEK_PK = getStr(data, "encUEK_PK");
+        String iv_PK = getStr(data, "iv_PK");
 
-        // Fall back to old v2 format field names
-        if (userKeyCipher.length() == 0) {
-            userKeyCipher = getStr(data, "encryptedDEK");
+        // Fall back to old field names if new ones not present
+        if (encUEK_PK.length() == 0) {
+            encUEK_PK = getStr(data, "userKeyCipher");
         }
-        if (userKeyIV.length() == 0) {
-            userKeyIV = getStr(data, "iv");
+        if (encUEK_PK.length() == 0) {
+            encUEK_PK = getStr(data, "encryptedDEK");
+        }
+        if (iv_PK.length() == 0) {
+            iv_PK = getStr(data, "userKeyIV");
+        }
+        if (iv_PK.length() == 0) {
+            iv_PK = getStr(data, "iv");
         }
 
-        if (salt.length() > 0 && userKeyCipher.length() > 0 && userKeyIV.length() > 0) {
+        if (salt.length() > 0 && encUEK_PK.length() > 0 && iv_PK.length() > 0) {
             long createdAt = getLong(data, "createdAt");
 
-            prefs.edit()
+            SharedPreferences.Editor editor = prefs.edit()
                     .putString(KEY_SALT, salt)
-                    .putString(KEY_USER_KEY_CIPHER, userKeyCipher)
-                    .putString(KEY_USER_KEY_IV, userKeyIV)
+                    .putString(KEY_ENC_UEK_PK, encUEK_PK)
+                    .putString(KEY_IV_PK, iv_PK)
                     .putString(KEY_ALGORITHM, algorithm.length() > 0 ? algorithm : CryptoManager.ALG_IDENTIFIER)
                     .putLong(KEY_CREATED_AT, createdAt)
                     .putBoolean(KEY_VAULT_INITIALIZED, true)
                     .putBoolean(KEY_VAULT_UPLOADED, true)
-                    .commit();
+                    .putBoolean(KEY_HAS_PK_WRAPPING, true);
+
+            // NOTE: We intentionally do NOT set encUEK_DBK or wrapped_db_key here
+            // because after Clear Data, the old DBK is lost anyway.
+            // The unlock flow (PATH B) will create a new DBK automatically.
+
+            editor.commit();
 
             return true;
         }
@@ -780,45 +1100,19 @@ public class KeyManager {
                 });
     }
 
-    // ======================== PASSWORD CHANGE ========================
+    // ======================== PASSWORD CHANGE (SIMPLIFIED) ========================
 
     /**
-     * Change master password. Re-derives UEK with Argon2id, re-encrypts with DB key.
-     * UEK itself changes because Argon2 output changes. Data must NOT be re-encrypted
-     * because we store the UEK cipher, not derive on-the-fly.
+     * Change master password.
+     * Since UEK is RANDOM (not derived), only the PK wrapping changes.
+     * Data stays encrypted with the same UEK -- NO re-encryption needed!
      *
-     * ACTUALLY: We need to re-encrypt the UEK cipher only.
-     * Old password -> derive old UEK -> decrypt stored UEK cipher to verify
-     * New password -> derive new UEK -> this IS the new UEK
-     * Encrypt new UEK with DB key -> store new cipher
-     * RE-ENCRYPT all data from old UEK to new UEK
-     *
-     * Wait -- the UEK is what encrypts data. If we change the password, the derived
-     * UEK changes. So we must re-encrypt all data. This is expensive.
-     *
-     * Notesnook's approach: UEK is a RANDOM key (like old DEK), not derived.
-     * The password-derived key wraps the UEK. On password change, only the wrapper changes.
-     *
-     * Adopting Notesnook approach: UEK is random, wrapped by password-derived key.
-     *
-     * But we already store UEK encrypted with DB key (not password-derived key).
-     * So password change = new salt + new Argon2 derivation, but UEK stays same.
-     * We verify password by comparing derived == stored (decrypted from DB key).
-     *
-     * SOLUTION: Store the UEK encrypted with BOTH:
-     * a) DB key (for device-local unlock after Keystore-based access)
-     * b) Password-derived key (for cross-device recovery)
-     *
-     * For simplicity and matching existing flow:
-     * - UEK is random (generated once)
-     * - Stored encrypted with DB key locally
-     * - Password verification: derive key from password, compare hash
-     * - Store password verification hash alongside
-     *
-     * REVISED APPROACH (simpler, matches plan):
-     * - UEK is random, wrapped by DB key (local) and by password-derived key (Firestore)
-     * - On password change: re-wrap UEK with new password-derived key, update Firestore
-     * - Data stays encrypted with same UEK
+     * Steps:
+     * 1. Verify old password (derive old PK, decrypt encUEK_PK)
+     * 2. Generate new salt, derive new PK
+     * 3. Re-wrap UEK with new PK
+     * 4. Also re-wrap UEK with existing DBK (new nonce)
+     * 5. Update local storage + Firestore
      */
     public void changePassword(final String oldPassword, final String newPassword,
                                 final VaultCallback callback) {
@@ -830,10 +1124,14 @@ public class KeyManager {
             if (callback != null) callback.onError("Vault not initialized");
             return;
         }
+        if (cachedUEK == null) {
+            if (callback != null) callback.onError("Vault is locked");
+            return;
+        }
 
         new Thread(() -> {
-            byte[] oldDerived = null;
-            byte[] newDerived = null;
+            byte[] oldPK = null;
+            byte[] newPK = null;
             byte[] dbKey = null;
 
             try {
@@ -846,79 +1144,84 @@ public class KeyManager {
                 byte[] oldSalt = Base64.decode(saltB64, Base64.NO_WRAP);
 
                 // Step 1: Verify old password
-                oldDerived = CryptoManager.deriveKeyArgon2(oldPassword, oldSalt);
-                if (oldDerived == null) {
+                oldPK = CryptoManager.deriveKeyArgon2(oldPassword, oldSalt);
+                if (oldPK == null) {
                     if (callback != null) callback.onError("Key derivation failed");
                     return;
                 }
 
-                // Get stored UEK from DB key
-                dbKey = getDBKey();
-                if (dbKey == null) {
-                    if (callback != null) callback.onError("DB key not available");
-                    return;
+                // Verify by decrypting encUEK_PK with old PK
+                String encUEK_PK_B64 = prefs.getString(KEY_ENC_UEK_PK, null);
+                String iv_PK_B64 = prefs.getString(KEY_IV_PK, null);
+
+                if (encUEK_PK_B64 != null && iv_PK_B64 != null) {
+                    byte[] verifyUEK = CryptoManager.decryptDEK(encUEK_PK_B64, iv_PK_B64, "", oldPK);
+                    if (verifyUEK == null) {
+                        CryptoManager.zeroFill(oldPK);
+                        if (callback != null) callback.onError("Old password incorrect");
+                        return;
+                    }
+                    CryptoManager.zeroFill(verifyUEK);
                 }
 
-                String userKeyCipherB64 = prefs.getString(KEY_USER_KEY_CIPHER, null);
-                String userKeyIVB64 = prefs.getString(KEY_USER_KEY_IV, null);
+                CryptoManager.zeroFill(oldPK);
+                oldPK = null;
 
-                byte[] storedUEK = CryptoManager.decryptDEK(userKeyCipherB64, userKeyIVB64, "", dbKey);
-                if (storedUEK == null) {
-                    if (callback != null) callback.onError("UEK decryption failed");
-                    return;
-                }
-
-                // Verify old password matches
-                if (!constantTimeEquals(oldDerived, storedUEK)) {
-                    CryptoManager.zeroFill(storedUEK);
-                    if (callback != null) callback.onError("Old password incorrect");
-                    return;
-                }
-
-                CryptoManager.zeroFill(oldDerived);
-                oldDerived = null;
-
-                // Step 2: Generate new salt, derive new key
+                // Step 2: Generate new salt, derive new PK
                 byte[] newSalt = CryptoManager.generateSalt();
-                newDerived = CryptoManager.deriveKeyArgon2(newPassword, newSalt);
-                if (newDerived == null) {
-                    CryptoManager.zeroFill(storedUEK);
+                newPK = CryptoManager.deriveKeyArgon2(newPassword, newSalt);
+                if (newPK == null) {
                     if (callback != null) callback.onError("New key derivation failed");
                     return;
                 }
 
-                // Step 3: Re-encrypt UEK with DB key (same UEK, new IV)
-                CryptoManager.VaultBundle bundle = CryptoManager.encryptDEK(storedUEK, dbKey);
-                CryptoManager.zeroFill(dbKey);
-                dbKey = null;
+                // Step 3: Re-wrap UEK with new PK
+                byte[] uekCopy = getDEK();
+                if (uekCopy == null) {
+                    CryptoManager.zeroFill(newPK);
+                    if (callback != null) callback.onError("UEK not available");
+                    return;
+                }
 
-                if (bundle == null) {
-                    CryptoManager.zeroFill(storedUEK);
+                CryptoManager.VaultBundle newPKBundle = CryptoManager.encryptDEK(uekCopy, newPK);
+                CryptoManager.zeroFill(newPK);
+                newPK = null;
+
+                if (newPKBundle == null) {
+                    CryptoManager.zeroFill(uekCopy);
                     if (callback != null) callback.onError("UEK re-encryption failed");
                     return;
                 }
 
+                // Step 4: Re-wrap UEK with existing DBK (new nonce)
                 String newSaltB64 = Base64.encodeToString(newSalt, Base64.NO_WRAP);
                 long createdAt = prefs.getLong(KEY_CREATED_AT, System.currentTimeMillis());
 
-                // Step 4: Update local storage
-                prefs.edit()
+                SharedPreferences.Editor editor = prefs.edit()
                         .putString(KEY_SALT, newSaltB64)
-                        .putString(KEY_USER_KEY_CIPHER, bundle.encryptedDEK)
-                        .putString(KEY_USER_KEY_IV, bundle.iv)
-                        .putBoolean(KEY_VAULT_UPLOADED, false)
-                        .commit();
+                        .putString(KEY_ENC_UEK_PK, newPKBundle.encryptedDEK)
+                        .putString(KEY_IV_PK, newPKBundle.iv)
+                        .putBoolean(KEY_VAULT_UPLOADED, false);
 
-                // Step 5: Update Firestore
-                uploadVaultToFirestoreWithConfirmation(newSaltB64, bundle.encryptedDEK,
-                        bundle.iv, createdAt);
+                dbKey = getDBKey();
+                if (dbKey != null) {
+                    CryptoManager.VaultBundle newDBKBundle = CryptoManager.encryptDEK(uekCopy, dbKey);
+                    CryptoManager.zeroFill(dbKey);
+                    dbKey = null;
+                    if (newDBKBundle != null) {
+                        editor.putString(KEY_ENC_UEK_DBK, newDBKBundle.encryptedDEK);
+                        editor.putString(KEY_IV_DBK, newDBKBundle.iv);
+                    }
+                }
 
-                // Update cached UEK
-                if (cachedUEK != null) Arrays.fill(cachedUEK, (byte) 0);
-                cachedUEK = storedUEK;
+                CryptoManager.zeroFill(uekCopy);
 
-                CryptoManager.zeroFill(newDerived);
-                newDerived = null;
+                // Step 5: Save
+                editor.commit();
+
+                // Upload to Firestore
+                uploadVaultToFirestoreWithConfirmation(newSaltB64, newPKBundle.encryptedDEK,
+                        newPKBundle.iv, createdAt);
 
                 Log.d(TAG, "Password changed successfully");
                 if (callback != null) callback.onSuccess();
@@ -927,8 +1230,8 @@ public class KeyManager {
                 Log.e(TAG, "Password change failed: " + e.getMessage());
                 if (callback != null) callback.onError(e.getMessage());
             } finally {
-                CryptoManager.zeroFill(oldDerived);
-                CryptoManager.zeroFill(newDerived);
+                CryptoManager.zeroFill(oldPK);
+                CryptoManager.zeroFill(newPK);
                 CryptoManager.zeroFill(dbKey);
             }
         }).start();
@@ -939,16 +1242,17 @@ public class KeyManager {
     /**
      * Store vault metadata locally after migration.
      */
-    public void storeVaultLocally(String saltB64, String userKeyCipherB64, String userKeyIVB64,
+    public void storeVaultLocally(String saltB64, String encUEK_PK_B64, String iv_PK_B64,
                                    String tagB64, long createdAt) {
         prefs.edit()
                 .putString(KEY_SALT, saltB64)
-                .putString(KEY_USER_KEY_CIPHER, userKeyCipherB64)
-                .putString(KEY_USER_KEY_IV, userKeyIVB64)
+                .putString(KEY_ENC_UEK_PK, encUEK_PK_B64)
+                .putString(KEY_IV_PK, iv_PK_B64)
                 .putString(KEY_ALGORITHM, CryptoManager.ALG_IDENTIFIER)
                 .putLong(KEY_CREATED_AT, createdAt)
                 .putBoolean(KEY_VAULT_INITIALIZED, true)
                 .putBoolean(KEY_VAULT_UPLOADED, false)
+                .putBoolean(KEY_HAS_PK_WRAPPING, true)
                 .commit();
     }
 
@@ -993,11 +1297,11 @@ public class KeyManager {
     }
 
     public String getEncryptedDEK() {
-        return prefs.getString(KEY_USER_KEY_CIPHER, null);
+        return prefs.getString(KEY_ENC_UEK_PK, null);
     }
 
     public String getVerifyTag() {
-        return prefs.getString(KEY_USER_KEY_IV, null);
+        return prefs.getString(KEY_IV_PK, null);
     }
 
     public String getLocalSalt() {
@@ -1005,15 +1309,15 @@ public class KeyManager {
     }
 
     public String getLocalEncryptedDEK() {
-        return prefs.getString(KEY_USER_KEY_CIPHER, null);
+        return prefs.getString(KEY_ENC_UEK_PK, null);
     }
 
     public String getLocalVerifyTag() {
-        return prefs.getString(KEY_USER_KEY_IV, null);
+        return prefs.getString(KEY_IV_PK, null);
     }
 
     public String getLocalIV() {
-        return prefs.getString(KEY_USER_KEY_IV, null);
+        return prefs.getString(KEY_IV_PK, null);
     }
 
     // ======================== BACKUP/RESTORE ========================
@@ -1022,12 +1326,13 @@ public class KeyManager {
                                         String ivB64, String tagB64, int iterations) {
         prefs.edit()
                 .putString(KEY_SALT, saltB64)
-                .putString(KEY_USER_KEY_CIPHER, encDEKB64)
-                .putString(KEY_USER_KEY_IV, ivB64)
+                .putString(KEY_ENC_UEK_PK, encDEKB64)
+                .putString(KEY_IV_PK, ivB64)
                 .putString(KEY_ALGORITHM, CryptoManager.ALG_IDENTIFIER)
                 .putLong(KEY_CREATED_AT, System.currentTimeMillis())
                 .putBoolean(KEY_VAULT_INITIALIZED, true)
                 .putBoolean(KEY_VAULT_UPLOADED, false)
+                .putBoolean(KEY_HAS_PK_WRAPPING, true)
                 .commit();
     }
 
