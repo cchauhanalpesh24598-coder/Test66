@@ -1,4 +1,4 @@
-name: Build APK + Generate SHA
+name: Build APK Stable SHA
 
 on:
   push:
@@ -19,56 +19,48 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ✅ Install Gradle manually
-      - name: Install Gradle
+      # ✅ Create FIXED Debug Keystore Only If Not Exists
+      - name: Create Stable Debug Keystore
         run: |
-          wget https://services.gradle.org/distributions/gradle-8.4-bin.zip
-          unzip gradle-8.4-bin.zip
-          echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
+          mkdir -p app/keystore
+          if [ ! -f app/keystore/debug.keystore ]; then
+            keytool -genkeypair \
+              -keystore app/keystore/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
-      # ✅ Generate Debug Keystore
-      - name: Generate Debug Keystore
-        run: |
-          mkdir -p $HOME/.android
-          keytool -genkeypair \
-            -keystore $HOME/.android/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-
-      # ✅ Print SHA (IMPORTANT)
-      - name: Print SHA Fingerprints
+      # ✅ Print SHA (Now It Will Always Be Same)
+      - name: Print Stable SHA
         run: |
           keytool -list -v \
-            -keystore $HOME/.android/debug.keystore \
+            -keystore app/keystore/debug.keystore \
             -alias androiddebugkey \
             -storepass android \
             -keypass android
-
-      # ✅ Generate Gradle Wrapper (Fix for missing jar)
-      - name: Generate Gradle Wrapper
-        working-directory: MKNotes
-        run: gradle wrapper --gradle-version 8.4
 
       - name: Make gradlew executable
         working-directory: MKNotes
         run: chmod +x gradlew
 
-      # ✅ Clean Project
       - name: Clean Project
         working-directory: MKNotes
         run: ./gradlew clean
 
-      # ✅ Build Debug APK
-      - name: Build Debug APK
+      - name: Build Debug APK Using Stable Keystore
         working-directory: MKNotes
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          ./gradlew assembleDebug \
+            -Pandroid.injected.signing.store.file=../app/keystore/debug.keystore \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android
 
-      # ✅ Upload APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
