@@ -1,74 +1,36 @@
-name: Build APK Stable SHA (Fixed Path)
+name: Generate Keystore (Run Once Only)
 
 on:
-  push:
-    branches: [ master ]
   workflow_dispatch:
 
 jobs:
-  build:
+  generate:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      # ✅ Install Gradle
-      - name: Install Gradle
+      - name: Generate Keystore and Print Base64
         run: |
-          wget https://services.gradle.org/distributions/gradle-8.4-bin.zip
-          unzip gradle-8.4-bin.zip
-          echo "$PWD/gradle-8.4/bin" >> $GITHUB_PATH
-
-      # ✅ Create Stable Debug Keystore INSIDE MKNotes/app/keystore
-      - name: Create Stable Debug Keystore
-        working-directory: MKNotes/app
-        run: |
-          mkdir -p keystore
           keytool -genkeypair \
-            -keystore keystore/debug.keystore \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
+            -keystore debug.keystore \
+            -storepass android123 \
+            -alias mknotes \
+            -keypass android123 \
             -keyalg RSA \
             -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-
-      # ✅ Print Stable SHA
-      - name: Print Stable SHA
-        working-directory: MKNotes/app
-        run: |
+            -validity 36500 \
+            -dname "CN=MKNotes,O=MKNotes,C=IN"
+          
+          echo "====== BASE64 KEYSTORE (copy this) ======"
+          base64 -w 0 debug.keystore
+          echo ""
+          echo "====== SHA-1 FINGERPRINT ======"
           keytool -list -v \
-            -keystore keystore/debug.keystore \
-            -alias androiddebugkey \
-            -storepass android \
-            -keypass android
-
-      # ✅ Clean Project
-      - name: Clean Project
-        working-directory: MKNotes
-        run: gradle clean
-
-      # ✅ Build Debug APK
-      - name: Build Debug APK
-        working-directory: MKNotes
-        run: |
-          gradle assembleDebug \
-            -Pandroid.injected.signing.store.file=${{ github.workspace }}/MKNotes/app/keystore/debug.keystore \
-            -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: MKNotes-debug
-          path: MKNotes/app/build/outputs/apk/debug/*.apk
-          retention-days: 30
+            -keystore debug.keystore \
+            -alias mknotes \
+            -storepass android123 \
+            -keypass android123 | grep "SHA1:"
+          echo "====== SHA-256 FINGERPRINT ======"
+          keytool -list -v \
+            -keystore debug.keystore \
+            -alias mknotes \
+            -storepass android123 \
+            -keypass android123 | grep "SHA256:"
