@@ -39,8 +39,15 @@ import com.mknotes.app.util.SessionManager;
  *    c. No vault + notes exist -> LEGACY RECOVERY mode
  * 4. If not logged in -> CREATE mode (offline use)
  *
- * REINSTALL PROOF: Vault metadata stored in Firestore at
- * users/{uid}/crypto_metadata/vault. On reinstall, fetched and cached locally.
+ * REINSTALL/CLEAR-DATA PROOF: Vault metadata stored in Firestore at
+ * users/{uid}/crypto_metadata/vault. On reinstall or Clear Data,
+ * vault is fetched from Firestore and UEK is recovered using
+ * password-derived key (PK) -- no device-local DBK needed.
+ *
+ * CHANGE LOG v4:
+ * - handleUnlock() now shows "Recovering vault..." for PATH B (PK recovery)
+ *   when DBK wrapping is missing (Clear Data scenario)
+ * - No other changes needed -- KeyManager.unlockVault() handles dual-path
  */
 public class MasterPasswordActivity extends Activity {
 
@@ -409,7 +416,7 @@ public class MasterPasswordActivity extends Activity {
         });
     }
 
-    // ======================== HANDLE UNLOCK ========================
+    // ======================== HANDLE UNLOCK (UPDATED v4) ========================
 
     private void handleUnlock() {
         final String password = editPassword.getText().toString();
@@ -421,15 +428,24 @@ public class MasterPasswordActivity extends Activity {
 
         btnAction.setEnabled(false);
         textError.setVisibility(View.GONE);
+
+        // Show appropriate message based on unlock path
         if (textSubtitle != null) {
-            textSubtitle.setText("Unlocking vault...");
+            if (keyManager.isVaultInitialized() && !keyManager.hasDBKWrapping()
+                    && keyManager.hasPKWrapping()) {
+                // Clear Data scenario: DBK missing, will use PATH B (PK recovery)
+                textSubtitle.setText("Recovering vault from cloud...");
+                Log.d(TAG, "[UNLOCK] PATH B detected: DBK missing, using PK recovery");
+            } else {
+                textSubtitle.setText("Unlocking vault...");
+            }
         }
 
-        // New v2 vault system
+        // New v2+ vault system
         if (keyManager.isVaultInitialized()) {
-            Log.d(TAG, "Attempting unlock with v2 vault system");
+            Log.d(TAG, "Attempting unlock with vault system (dual-path)");
 
-            // Run unlock on background thread (PBKDF2 is CPU-intensive)
+            // Run unlock on background thread (Argon2 is CPU-intensive)
             new Thread(new Runnable() {
                 public void run() {
                     final boolean valid = keyManager.unlockVault(password);
@@ -629,11 +645,6 @@ public class MasterPasswordActivity extends Activity {
      * CRITICAL FIX v3: Perform cloud sync BEFORE launching MainActivity.
      * This ensures that after reinstall, notes are already in local DB
      * and DEK is fully ready when MainActivity.loadNotes() runs.
-     *
-     * ARCHITECTURE FIX: Uses keyManager.isVaultUnlocked() instead of
-     * sessionManager.isSessionValid() to decide whether sync is possible.
-     * The vault unlock state (DEK in memory) is the authoritative check.
-     * Session timestamp is secondary and can have timing issues.
      */
     private void launchMain() {
         PrefsManager prefs = PrefsManager.getInstance(this);
@@ -651,7 +662,6 @@ public class MasterPasswordActivity extends Activity {
         // CRITICAL: If logged in and cloud sync enabled, perform sync HERE
         // before going to MainActivity. This guarantees notes are in local DB
         // with DEK fully ready. No race condition possible.
-        // FIX v3: Check keyManager.isVaultUnlocked() instead of session timestamp
         if (authManager.isLoggedIn() && prefs.isCloudSyncEnabled()
                 && keyManager.isVaultUnlocked()) {
             Log.d(TAG, "[LAUNCH] Performing pre-launch cloud sync...");
