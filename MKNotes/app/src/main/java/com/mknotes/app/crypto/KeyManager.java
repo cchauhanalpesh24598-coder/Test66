@@ -246,6 +246,31 @@ public class KeyManager {
         return copy;
     }
 
+    /**
+     * Load DB key from Keystore-wrapped storage into memory cache.
+     * Called by MigrationManager and NotesApplication when DB key
+     * already exists but is not yet cached in memory.
+     *
+     * @return true if DB key loaded and cached successfully
+     */
+    public boolean loadDBKey() {
+        return unwrapAndCacheDBKey();
+    }
+
+    /**
+     * Get hex-encoded DB key string.
+     * Used by MigrationManager for sqlcipher_export passphrase.
+     *
+     * @return hex string of DB key, or null if not available
+     */
+    public String getDBKeyHex() {
+        if (cachedDBKey == null) {
+            unwrapAndCacheDBKey();
+        }
+        if (cachedDBKey == null) return null;
+        return CryptoManager.bytesToHex(cachedDBKey);
+    }
+
     // ======================== VAULT CREATION (v4 REWRITTEN) ========================
 
     /**
