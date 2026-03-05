@@ -155,6 +155,18 @@ public final class CryptoManager {
         }
     }
 
+    /**
+     * Alias for deriveKeyArgon2id() -- kept for backward compatibility.
+     * MigrationManager calls this method name.
+     *
+     * @param password user's master password
+     * @param salt     16-byte salt
+     * @return byte[32] derived key, or null on failure
+     */
+    public static byte[] deriveKeyArgon2(String password, byte[] salt) {
+        return deriveKeyArgon2id(password, salt);
+    }
+
     // ======================== XChaCha20-Poly1305 ENCRYPTION ========================
 
     /**
