@@ -15,15 +15,21 @@ import javax.crypto.spec.GCMParameterSpec;
 /**
  * Android Keystore wrapper for hardware-backed key protection.
  *
- * v4 CHANGE: Keystore is now ONLY used for:
- * 1. SQLCipher DB key wrapping (local DB encryption)
- * 2. Optional DEK session caching (future enhancement)
+ * v4 ROLE CHANGE:
+ * ===============
+ * PURANA (v3): Keystore wrap karta tha DB Key ko, jo vault unlock chain me use hota tha.
+ *              Agar Keystore delete ho jaye (clear data) -> DB Key lost -> vault unrecoverable.
  *
- * Keystore is NOT in the vault unlock chain.
- * If Keystore key is lost (clear data), a new DB key is generated
- * and the local SQLCipher DB is re-populated from cloud sync.
- * The actual DEK (note encryption key) is recovered purely from
- * password + Firestore vault metadata.
+ * NAYA (v4):   Keystore SIRF optional session DEK cache ke liye use hota hai.
+ *              Vault unlock chain me Keystore ka koi role NAHI hai.
+ *              Agar Keystore delete ho jaye -> koi problem nahi, user password se vault unlock hoga.
+ *
+ * Usage:
+ * - wraps/unwraps the session DEK cache (for fast session resumption without Argon2id)
+ * - wraps/unwraps the SQLCipher DB key (for database passphrase)
+ * - Both are OPTIONAL -- vault security does NOT depend on Keystore anymore
+ *
+ * The Keystore key itself never leaves the secure hardware (TEE/StrongBox).
  */
 public final class SecureKeyStore {
 
@@ -32,16 +38,16 @@ public final class SecureKeyStore {
     private static final String TRANSFORMATION   = "AES/GCM/NoPadding";
     private static final int    GCM_TAG_BITS     = 128;
 
-    /** Default alias for the DB key master wrapper (SQLCipher only). */
+    /** Default alias for the DB key master wrapper (also used for session DEK cache). */
     public static final String ALIAS_DB_KEY_MASTER = "mknotes_db_key_master";
-
-    /** Optional alias for session DEK cache (future use). */
-    public static final String ALIAS_SESSION_DEK_CACHE = "mknotes_session_dek";
 
     private SecureKeyStore() {}
 
     /**
      * Generate a new AES-256-GCM key in Android Keystore if it doesn't already exist.
+     *
+     * @param alias Keystore alias
+     * @return true if key exists or was created, false on failure
      */
     public static boolean generateOrGetKeystoreKey(String alias) {
         try {
@@ -73,7 +79,13 @@ public final class SecureKeyStore {
 
     /**
      * Wrap (encrypt) a plaintext key with the Keystore master key.
-     * Used for SQLCipher DB key protection only (not vault DEK).
+     *
+     * v4: Used for OPTIONAL session DEK cache and SQLCipher DB key.
+     * NOT used in vault unlock chain anymore.
+     *
+     * @param alias    Keystore alias
+     * @param plainKey raw key bytes to protect (e.g. 32-byte DEK or DB key)
+     * @return Base64 string "iv:ciphertext" or null on failure
      */
     public static String wrapKey(String alias, byte[] plainKey) {
         if (plainKey == null || plainKey.length == 0) return null;
@@ -102,13 +114,19 @@ public final class SecureKeyStore {
 
     /**
      * Unwrap (decrypt) a wrapped key using the Keystore master key.
-     * Returns null if Keystore key was invalidated (e.g., after clear data).
+     *
+     * v4: Used for OPTIONAL session DEK cache and SQLCipher DB key.
+     * If this fails (e.g. after clear data), vault unlock still works via password.
+     *
+     * @param alias      Keystore alias
+     * @param wrappedData Base64 "iv:ciphertext" string from wrapKey()
+     * @return raw key bytes, or null on failure
      */
     public static byte[] unwrapKey(String alias, String wrappedData) {
         if (wrappedData == null || !wrappedData.contains(":")) return null;
         try {
-            int    colonIdx  = wrappedData.indexOf(':');
-            byte[] iv        = Base64.decode(wrappedData.substring(0, colonIdx), Base64.NO_WRAP);
+            int    colonIdx = wrappedData.indexOf(':');
+            byte[] iv       = Base64.decode(wrappedData.substring(0, colonIdx), Base64.NO_WRAP);
             byte[] encrypted = Base64.decode(wrappedData.substring(colonIdx + 1), Base64.NO_WRAP);
 
             KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
@@ -119,12 +137,12 @@ public final class SecureKeyStore {
                 return null;
             }
 
-            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            Cipher         cipher  = Cipher.getInstance(TRANSFORMATION);
             GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_BITS, iv);
             cipher.init(Cipher.DECRYPT_MODE, keystoreKey, gcmSpec);
             return cipher.doFinal(encrypted);
         } catch (android.security.keystore.KeyPermanentlyInvalidatedException e) {
-            Log.e(TAG, "unwrapKey: Key permanently invalidated (clear data / biometric change)");
+            Log.e(TAG, "unwrapKey: Key permanently invalidated (biometric/lockscreen changed)");
             return null;
         } catch (Exception e) {
             Log.e(TAG, "unwrapKey failed: " + e.getMessage());
@@ -134,6 +152,8 @@ public final class SecureKeyStore {
 
     /**
      * Delete a Keystore key entry.
+     *
+     * @param alias Keystore alias to remove
      */
     public static void deleteKey(String alias) {
         try {
