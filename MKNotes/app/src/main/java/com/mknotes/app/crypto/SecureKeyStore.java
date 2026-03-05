@@ -13,63 +13,58 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 /**
- * Android Keystore wrapper for hardware-backed key storage.
+ * Android Keystore wrapper for hardware-backed key protection.
  *
- * Provides AES-256-GCM key wrapping for the Database Key (DBK).
- * The Keystore master key never leaves the secure hardware (TEE/StrongBox).
+ * v4 CHANGE: Keystore is now ONLY used for:
+ * 1. SQLCipher DB key wrapping (local DB encryption)
+ * 2. Optional DEK session caching (future enhancement)
  *
- * Usage:
- * - generateOrGetKeystoreKey(alias) - creates or retrieves AES-256-GCM key in Keystore
- * - wrapKey(alias, plainKey) - encrypts a 256-bit key with Keystore key
- * - unwrapKey(alias, wrappedData) - decrypts wrapped key using Keystore key
- * - deleteKey(alias) - removes Keystore entry
+ * Keystore is NOT in the vault unlock chain.
+ * If Keystore key is lost (clear data), a new DB key is generated
+ * and the local SQLCipher DB is re-populated from cloud sync.
+ * The actual DEK (note encryption key) is recovered purely from
+ * password + Firestore vault metadata.
  */
 public final class SecureKeyStore {
 
     private static final String TAG = "SecureKeyStore";
-    private static final String KEYSTORE_PROVIDER = "AndroidKeyStore";
-    private static final int GCM_TAG_LENGTH_BITS = 128;
-    private static final int GCM_IV_LENGTH = 12;
+    private static final String ANDROID_KEYSTORE = "AndroidKeyStore";
+    private static final String TRANSFORMATION   = "AES/GCM/NoPadding";
+    private static final int    GCM_TAG_BITS     = 128;
 
-    /** Alias for the master Keystore key that wraps the DB key. */
+    /** Default alias for the DB key master wrapper (SQLCipher only). */
     public static final String ALIAS_DB_KEY_MASTER = "mknotes_db_key_master";
 
-    private SecureKeyStore() {
-        // Static utility class
-    }
+    /** Optional alias for session DEK cache (future use). */
+    public static final String ALIAS_SESSION_DEK_CACHE = "mknotes_session_dek";
+
+    private SecureKeyStore() {}
 
     /**
-     * Generate a new AES-256-GCM key in Android Keystore, or get existing one.
-     *
-     * @param alias the Keystore alias
-     * @return true if key exists or was created successfully
+     * Generate a new AES-256-GCM key in Android Keystore if it doesn't already exist.
      */
     public static boolean generateOrGetKeystoreKey(String alias) {
         try {
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER);
-            keyStore.load(null);
-
-            if (keyStore.containsAlias(alias)) {
-                Log.d(TAG, "Keystore key already exists: " + alias);
+            KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
+            ks.load(null);
+            if (ks.containsAlias(alias)) {
                 return true;
             }
 
-            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(alias,
+            KeyGenerator kg = KeyGenerator.getInstance(
+                    KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE);
+            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(
+                    alias,
                     KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
                     .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                     .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                     .setKeySize(256)
                     .setRandomizedEncryptionRequired(true)
                     .build();
-
-            KeyGenerator keyGenerator = KeyGenerator.getInstance(
-                    KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER);
-            keyGenerator.init(spec);
-            keyGenerator.generateKey();
-
-            Log.d(TAG, "Keystore key generated: " + alias);
+            kg.init(spec);
+            kg.generateKey();
+            Log.d(TAG, "Generated Keystore key: " + alias);
             return true;
-
         } catch (Exception e) {
             Log.e(TAG, "Failed to generate Keystore key: " + e.getMessage());
             return false;
@@ -77,39 +72,28 @@ public final class SecureKeyStore {
     }
 
     /**
-     * Wrap (encrypt) a plaintext key using the Keystore master key.
-     * Returns Base64-encoded string: "ivBase64:ciphertextBase64"
-     *
-     * @param alias    the Keystore alias
-     * @param plainKey the raw key bytes to wrap (e.g., 32-byte DB key)
-     * @return wrapped key string, or null on failure
+     * Wrap (encrypt) a plaintext key with the Keystore master key.
+     * Used for SQLCipher DB key protection only (not vault DEK).
      */
     public static String wrapKey(String alias, byte[] plainKey) {
-        if (plainKey == null || plainKey.length == 0) {
-            Log.e(TAG, "wrapKey: null or empty plainKey");
-            return null;
-        }
+        if (plainKey == null || plainKey.length == 0) return null;
         try {
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER);
-            keyStore.load(null);
-
-            SecretKey keystoreKey = (SecretKey) keyStore.getKey(alias, null);
+            KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
+            ks.load(null);
+            SecretKey keystoreKey = (SecretKey) ks.getKey(alias, null);
             if (keystoreKey == null) {
                 Log.e(TAG, "wrapKey: Keystore key not found: " + alias);
                 return null;
             }
 
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
             cipher.init(Cipher.ENCRYPT_MODE, keystoreKey);
-
-            byte[] iv = cipher.getIV();
-            byte[] ciphertext = cipher.doFinal(plainKey);
+            byte[] iv        = cipher.getIV();
+            byte[] encrypted = cipher.doFinal(plainKey);
 
             String ivB64 = Base64.encodeToString(iv, Base64.NO_WRAP);
-            String ctB64 = Base64.encodeToString(ciphertext, Base64.NO_WRAP);
-
+            String ctB64 = Base64.encodeToString(encrypted, Base64.NO_WRAP);
             return ivB64 + ":" + ctB64;
-
         } catch (Exception e) {
             Log.e(TAG, "wrapKey failed: " + e.getMessage());
             return null;
@@ -118,51 +102,29 @@ public final class SecureKeyStore {
 
     /**
      * Unwrap (decrypt) a wrapped key using the Keystore master key.
-     *
-     * @param alias       the Keystore alias
-     * @param wrappedData the wrapped key string ("ivBase64:ciphertextBase64")
-     * @return raw key bytes, or null on failure
+     * Returns null if Keystore key was invalidated (e.g., after clear data).
      */
     public static byte[] unwrapKey(String alias, String wrappedData) {
-        if (wrappedData == null || wrappedData.length() == 0) {
-            Log.e(TAG, "unwrapKey: null or empty wrappedData");
-            return null;
-        }
+        if (wrappedData == null || !wrappedData.contains(":")) return null;
         try {
-            int colonIdx = wrappedData.indexOf(':');
-            if (colonIdx <= 0) {
-                Log.e(TAG, "unwrapKey: invalid format (no colon)");
-                return null;
-            }
+            int    colonIdx  = wrappedData.indexOf(':');
+            byte[] iv        = Base64.decode(wrappedData.substring(0, colonIdx), Base64.NO_WRAP);
+            byte[] encrypted = Base64.decode(wrappedData.substring(colonIdx + 1), Base64.NO_WRAP);
 
-            String ivB64 = wrappedData.substring(0, colonIdx);
-            String ctB64 = wrappedData.substring(colonIdx + 1);
-
-            byte[] iv = Base64.decode(ivB64, Base64.NO_WRAP);
-            byte[] ciphertext = Base64.decode(ctB64, Base64.NO_WRAP);
-
-            if (iv.length != GCM_IV_LENGTH) {
-                Log.e(TAG, "unwrapKey: invalid IV length=" + iv.length);
-                return null;
-            }
-
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER);
-            keyStore.load(null);
-
-            SecretKey keystoreKey = (SecretKey) keyStore.getKey(alias, null);
+            KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
+            ks.load(null);
+            SecretKey keystoreKey = (SecretKey) ks.getKey(alias, null);
             if (keystoreKey == null) {
                 Log.e(TAG, "unwrapKey: Keystore key not found: " + alias);
                 return null;
             }
 
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_BITS, iv);
             cipher.init(Cipher.DECRYPT_MODE, keystoreKey, gcmSpec);
-
-            return cipher.doFinal(ciphertext);
-
+            return cipher.doFinal(encrypted);
         } catch (android.security.keystore.KeyPermanentlyInvalidatedException e) {
-            Log.e(TAG, "unwrapKey: Key permanently invalidated (device security changed)");
+            Log.e(TAG, "unwrapKey: Key permanently invalidated (clear data / biometric change)");
             return null;
         } catch (Exception e) {
             Log.e(TAG, "unwrapKey failed: " + e.getMessage());
@@ -172,40 +134,29 @@ public final class SecureKeyStore {
 
     /**
      * Delete a Keystore key entry.
-     *
-     * @param alias the Keystore alias to delete
-     * @return true if deleted or didn't exist
      */
-    public static boolean deleteKey(String alias) {
+    public static void deleteKey(String alias) {
         try {
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER);
-            keyStore.load(null);
-
-            if (keyStore.containsAlias(alias)) {
-                keyStore.deleteEntry(alias);
-                Log.d(TAG, "Keystore key deleted: " + alias);
+            KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
+            ks.load(null);
+            if (ks.containsAlias(alias)) {
+                ks.deleteEntry(alias);
+                Log.d(TAG, "Deleted Keystore key: " + alias);
             }
-            return true;
-
         } catch (Exception e) {
             Log.e(TAG, "deleteKey failed: " + e.getMessage());
-            return false;
         }
     }
 
     /**
      * Check if a Keystore key exists.
-     *
-     * @param alias the Keystore alias to check
-     * @return true if key exists
      */
-    public static boolean keyExists(String alias) {
+    public static boolean hasKey(String alias) {
         try {
-            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER);
-            keyStore.load(null);
-            return keyStore.containsAlias(alias);
+            KeyStore ks = KeyStore.getInstance(ANDROID_KEYSTORE);
+            ks.load(null);
+            return ks.containsAlias(alias);
         } catch (Exception e) {
-            Log.e(TAG, "keyExists check failed: " + e.getMessage());
             return false;
         }
     }
