@@ -136,7 +136,7 @@ public final class CryptoManager {
             byte[] key = new byte[KEY_LENGTH_BYTES];
             byte[] passwordBytes = password.getBytes(StandardCharsets.UTF_8);
 
-            boolean success = getSodium().crypto_pwhash(
+            int pwhashResult = getSodium().crypto_pwhash(
                     key, key.length,
                     passwordBytes, passwordBytes.length,
                     salt,
@@ -144,7 +144,7 @@ public final class CryptoManager {
                     new NativeLong(ARGON2_MEM_LIMIT),
                     ARGON2_ALG);
 
-            if (!success) {
+            if (pwhashResult != 0) {
                 Log.e(TAG, "deriveKeyArgon2id: crypto_pwhash failed");
                 return null;
             }
@@ -186,23 +186,23 @@ public final class CryptoManager {
 
             byte[] plaintextBytes = plaintext.getBytes(StandardCharsets.UTF_8);
             byte[] ciphertext     = new byte[plaintextBytes.length + XCHACHA_TAG_BYTES];
-            int[]  ciphertextLen  = new int[1];
+            long[] ciphertextLen  = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            int encResult = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
                     plaintextBytes, plaintextBytes.length,
                     null, 0,  // no additional data
                     null,     // nsec (unused)
                     nonce, key);
 
-            if (!success) {
+            if (encResult != 0) {
                 Log.e(TAG, "encrypt: xchacha20poly1305 encrypt failed");
                 return null;
             }
 
             String nonceB64 = Base64.encodeToString(nonce, Base64.NO_WRAP);
             // Use actual ciphertext length if available, otherwise full buffer
-            int ctLen = ciphertextLen[0] > 0 ? ciphertextLen[0] : ciphertext.length;
+            int ctLen = ciphertextLen[0] > 0 ? (int) ciphertextLen[0] : ciphertext.length;
             byte[] actualCt = ctLen < ciphertext.length ? Arrays.copyOf(ciphertext, ctLen) : ciphertext;
             String ctB64 = Base64.encodeToString(actualCt, Base64.NO_WRAP);
 
@@ -229,19 +229,19 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[plainBytes.length + XCHACHA_TAG_BYTES];
-            int[]  ctLen      = new int[1];
+            long[] ctLen      = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            int encResult = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ctLen,
                     plainBytes, plainBytes.length,
                     null, 0, null, nonce, key);
 
-            if (!success) {
+            if (encResult != 0) {
                 Log.e(TAG, "encryptBytes: xchacha20poly1305 encrypt failed");
                 return null;
             }
 
-            int actualLen = ctLen[0] > 0 ? ctLen[0] : ciphertext.length;
+            int actualLen = ctLen[0] > 0 ? (int) ctLen[0] : ciphertext.length;
             byte[] actualCt = actualLen < ciphertext.length
                     ? Arrays.copyOf(ciphertext, actualLen) : ciphertext;
 
@@ -269,21 +269,21 @@ public final class CryptoManager {
         if (ciphertext.length <= XCHACHA_TAG_BYTES) return null;
         try {
             byte[] plaintext    = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
-            int[]  plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            int decResult = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null,  // nsec (unused)
                     ciphertext, ciphertext.length,
                     null, 0, // no additional data
                     nonce, key);
 
-            if (!success) {
+            if (decResult != 0) {
                 Log.w(TAG, "decryptBytes: authentication failed (wrong key or tampered)");
                 return null;
             }
 
-            int ptLen = plaintextLen[0] > 0 ? plaintextLen[0] : plaintext.length;
+            int ptLen = plaintextLen[0] > 0 ? (int) plaintextLen[0] : plaintext.length;
             return ptLen < plaintext.length ? Arrays.copyOf(plaintext, ptLen) : plaintext;
         } catch (Exception e) {
             Log.e(TAG, "decryptBytes failed: " + e.getMessage());
@@ -336,21 +336,21 @@ public final class CryptoManager {
             }
 
             byte[] plaintext    = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
-            int[]  plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            int decResult = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null, // nsec (unused)
                     ciphertext, ciphertext.length,
                     null, 0, // no additional data
                     nonce, key);
 
-            if (!success) {
+            if (decResult != 0) {
                 Log.w(TAG, "decryptXChaCha: authentication failed (wrong key or tampered)");
                 return null;
             }
 
-            int ptLen = plaintextLen[0] > 0 ? plaintextLen[0] : plaintext.length;
+            int ptLen = plaintextLen[0] > 0 ? (int) plaintextLen[0] : plaintext.length;
             return new String(plaintext, 0, ptLen, StandardCharsets.UTF_8);
         } catch (Exception e) {
             Log.e(TAG, "decryptXChaCha failed: " + e.getMessage());
@@ -392,14 +392,14 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_BYTES];
-            int[]  ctLen      = new int[1];
+            long[] ctLen      = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            int encResult = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ctLen,
                     dek, dek.length,
                     null, 0, null, nonce, derivedKey);
 
-            if (!success) {
+            if (encResult != 0) {
                 Log.e(TAG, "encryptDEKWithDerivedKey: XChaCha20 encrypt failed");
                 return null;
             }
@@ -442,14 +442,14 @@ public final class CryptoManager {
             }
 
             byte[] plaintext    = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
-            int[]  plaintextLen = new int[1];
+            long[] plaintextLen = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            int decResult = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
                     null, ciphertext, ciphertext.length,
                     null, 0, nonce, derivedKey);
 
-            if (!success) {
+            if (decResult != 0) {
                 Log.w(TAG, "decryptDEKWithDerivedKey: auth failed -- wrong password");
                 return null;
             }
@@ -480,14 +480,14 @@ public final class CryptoManager {
             sRandom.nextBytes(nonce);
 
             byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_BYTES];
-            int[]  ctLen      = new int[1];
+            long[] ctLen      = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            int encResult = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ctLen,
                     dek, dek.length,
                     null, 0, null, nonce, wrappingKey);
 
-            if (!success) return null;
+            if (encResult != 0) return null;
 
             VaultBundle bundle = new VaultBundle();
             bundle.encryptedDEK = Base64.encodeToString(ciphertext, Base64.NO_WRAP);
@@ -524,14 +524,14 @@ public final class CryptoManager {
             byte[] ciphertext = Base64.decode(encDEKB64, Base64.NO_WRAP);
 
             byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
-            int[]  ptLen     = new int[1];
+            long[] ptLen     = new long[1];
 
-            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            int decResult = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, ptLen,
                     null, ciphertext, ciphertext.length,
                     null, 0, nonce, key);
 
-            if (!success) {
+            if (decResult != 0) {
                 Log.w(TAG, "decryptDEKXChaCha: auth failed -- wrong key");
                 return null;
             }
