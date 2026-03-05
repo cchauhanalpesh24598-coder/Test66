@@ -5,259 +5,181 @@ import android.util.Log;
 
 import com.goterl.lazysodium.LazySodiumAndroid;
 import com.goterl.lazysodium.SodiumAndroid;
-import com.goterl.lazysodium.interfaces.AEAD;
-import com.goterl.lazysodium.interfaces.PwHash;
 import com.sun.jna.NativeLong;
 
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
 /**
- * Core encryption engine -- Notesnook-equivalent architecture.
+ * Core encryption engine -- FIXED Architecture (v4).
  *
- * Architecture:
- * - Argon2id key derivation (ops=3, mem=65536 KiB, ALG_ARGON2ID13)
- * - XChaCha20-Poly1305 IETF for authenticated encryption (24-byte nonce)
- * - 256-bit keys throughout
- * - JSON cipher format: {"alg":"xcha-argon2id13","ct":"base64","iv":"base64","salt":"base64","len":N}
+ * KEY CHANGE: DB Key (Keystore-bound) is NO LONGER in the vault unlock chain.
+ * DEK is now wrapped directly with password-derived key (Argon2id).
+ * This makes vault recovery device-independent.
  *
- * Backward compatibility:
- * - Detects old "ivHex:ciphertextHex" AES-GCM format for migration decryption
- * - Legacy PBKDF2 key derivation kept in separate methods for migration ONLY
+ * Primitives (via lazysodium-android / libsodium):
+ * - KDF: Argon2id (crypto_pwhash, ALG_ARGON2ID13, opsLimit=3, memLimit=67108864)
+ * - DEK wrapping: XChaCha20-Poly1305 (derivedKey wraps DEK)
+ * - Data encryption: XChaCha20-Poly1305 IETF (24-byte nonce, 16-byte tag)
  *
- * Memory safety:
- * - Key material is byte[], never String
- * - zeroFill() overwrites with 0x00
+ * Storage format for field encryption:
+ * "xcha:{base64_nonce}:{base64_ciphertext}"
+ *
+ * Old format detection (migration):
+ * "ivHex:ciphertextHex" where ivHex is 24 hex chars (12 bytes AES-GCM)
+ *
+ * Memory safety: key material is byte[], zeroed via zeroFill().
+ *
+ * LEGACY SUPPORT: Old PBKDF2/AES-GCM methods kept for migration only.
  */
 public final class CryptoManager {
 
     private static final String TAG = "CryptoManager";
 
-    // ======================== LAZYSODIUM SINGLETON ========================
-
+    // ============ Lazysodium singleton ============
     private static LazySodiumAndroid lazySodium;
     private static SodiumAndroid sodiumAndroid;
 
-    /**
-     * Initialize lazysodium. MUST be called once in Application.onCreate().
-     */
+    /** Prefix for new XChaCha20-Poly1305 encrypted data. */
+    public static final String XCHA_PREFIX = "xcha:";
+
+    /** XChaCha20-Poly1305 constants */
+    private static final int XCHACHA_NONCE_BYTES = 24;
+    private static final int XCHACHA_TAG_BYTES   = 16; // Poly1305 auth tag appended
+    private static final int KEY_LENGTH_BYTES     = 32;
+
+    /** Argon2id KDF constants (matching Notesnook) */
+    private static final int  ARGON2_SALT_BYTES = 16;
+    private static final int  ARGON2_OPS_LIMIT  = 3;          // crypto_pwhash_OPSLIMIT_MODERATE
+    private static final long ARGON2_MEM_LIMIT  = 67108864L;  // 64 MiB
+    private static final int  ARGON2_ALG        = 2;          // crypto_pwhash_ALG_ARGON2ID13
+
+    /** Old PBKDF2 constants -- ONLY for legacy migration. */
+    public static final int FIXED_ITERATIONS  = 120_000;
+    public static final int LEGACY_ITERATIONS = 15_000;
+    private static final int GCM_IV_LENGTH       = 12;
+    private static final int GCM_TAG_LENGTH_BITS = 128;
+
+    private static final SecureRandom sRandom = new SecureRandom();
+
+    public static final String DECRYPT_FAILED_MARKER = "[DECRYPTION_FAILED]";
+
+    private CryptoManager() {}
+
+    // ======================== INITIALIZATION ========================
+
     public static synchronized void init() {
         if (lazySodium == null) {
             sodiumAndroid = new SodiumAndroid();
-            lazySodium = new LazySodiumAndroid(sodiumAndroid);
-            Log.d(TAG, "Lazysodium initialized");
+            lazySodium    = new LazySodiumAndroid(sodiumAndroid);
+            Log.d(TAG, "Lazysodium initialized (libsodium loaded)");
         }
     }
 
     public static LazySodiumAndroid getLazySodium() {
-        if (lazySodium == null) {
-            init();
-        }
+        if (lazySodium == null) throw new IllegalStateException("CryptoManager.init() not called");
         return lazySodium;
     }
 
     public static SodiumAndroid getSodium() {
-        if (sodiumAndroid == null) {
-            init();
-        }
+        if (sodiumAndroid == null) throw new IllegalStateException("CryptoManager.init() not called");
         return sodiumAndroid;
     }
 
-    // ======================== CONSTANTS ========================
+    // ======================== SALT & DEK GENERATION ========================
 
-    /** XChaCha20-Poly1305 nonce length: 24 bytes */
-    public static final int XCHACHA_NONCE_LENGTH = 24;
-
-    /** XChaCha20-Poly1305 auth tag overhead: 16 bytes */
-    public static final int XCHACHA_TAG_LENGTH = 16;
-
-    /** Key length: 256 bits = 32 bytes */
-    public static final int KEY_LENGTH_BYTES = 32;
-
-    /** Salt length for Argon2: 16 bytes */
-    public static final int SALT_LENGTH = 16;
-
-    /** Argon2id parameters matching Notesnook:
-     *  ops=3 (time cost), mem=65536 KiB (64 MB), ALG_ARGON2ID13 */
-    public static final int ARGON2_OPS_LIMIT = 3;
-    public static final long ARGON2_MEM_LIMIT = 65536L * 1024L; // 64 MB in bytes
-    public static final int ARGON2_ALG = PwHash.Alg.PWHASH_ALG_ARGON2ID13.getValue();
-
-    /** Algorithm identifier for cipher format */
-    public static final String ALG_IDENTIFIER = "xcha-argon2id13";
-
-    /** FIXED iteration count for LEGACY PBKDF2 ONLY -- NEVER change. */
-    public static final int FIXED_ITERATIONS = 120_000;
-    public static final int LEGACY_ITERATIONS = 15_000;
-
-    /** Old AES-GCM constants for migration backward compatibility */
-    private static final int OLD_GCM_IV_LENGTH = 12;
-
-    private static final SecureRandom sRandom = new SecureRandom();
-
-    private CryptoManager() {
-        // Static utility class
-    }
-
-    // ======================== SALT & KEY GENERATION ========================
-
-    /**
-     * Generate a cryptographically random 16-byte salt.
-     */
     public static byte[] generateSalt() {
-        byte[] salt = new byte[SALT_LENGTH];
+        byte[] salt = new byte[ARGON2_SALT_BYTES];
         sRandom.nextBytes(salt);
         return salt;
     }
 
-    /**
-     * Generate a cryptographically random 256-bit key (DEK/UEK/DBK).
-     */
     public static byte[] generateDEK() {
-        byte[] key = new byte[KEY_LENGTH_BYTES];
-        sRandom.nextBytes(key);
-        return key;
+        byte[] dek = new byte[KEY_LENGTH_BYTES];
+        sRandom.nextBytes(dek);
+        return dek;
     }
 
-    // ======================== KEY DERIVATION (ARGON2ID) ========================
+    // ======================== ARGON2ID KEY DERIVATION ========================
 
     /**
      * Derive a 256-bit key from password + salt using Argon2id.
-     * Parameters: ops=3, mem=65536 KiB (64 MB), ALG_ARGON2ID13.
-     *
-     * This is the PRIMARY key derivation for the new system.
+     * DETERMINISTIC: same password + same salt = same derivedKey.
+     * This is the foundation of device-independent vault recovery.
      *
      * @param password user's master password
      * @param salt     16-byte salt
      * @return byte[32] derived key, or null on failure
      */
-    public static byte[] deriveKeyArgon2(String password, byte[] salt) {
+    public static byte[] deriveKeyArgon2id(String password, byte[] salt) {
         if (password == null || password.length() == 0 || salt == null || salt.length == 0) {
-            Log.e(TAG, "deriveKeyArgon2: invalid input");
+            Log.e(TAG, "deriveKeyArgon2id: invalid input");
             return null;
         }
         try {
-            byte[] key = new byte[KEY_LENGTH_BYTES];
-            byte[] pwBytes = password.getBytes(StandardCharsets.UTF_8);
+            byte[] key           = new byte[KEY_LENGTH_BYTES];
+            byte[] passwordBytes = password.getBytes(StandardCharsets.UTF_8);
 
-            // FIX: crypto_pwhash returns int, check if == 0 for success
-            int result = getSodium().crypto_pwhash(
+            boolean success = getSodium().crypto_pwhash(
                     key, key.length,
-                    pwBytes, pwBytes.length,
+                    passwordBytes, passwordBytes.length,
                     salt,
                     ARGON2_OPS_LIMIT,
-                    new NativeLong(ARGON2_MEM_LIMIT),  // ✅ Fixed: Wrap in NativeLong
-                    ARGON2_ALG
-            );
+                    new NativeLong(ARGON2_MEM_LIMIT),
+                    ARGON2_ALG);
 
-            if (result == 0) {  // Changed from boolean success check to int == 0 check
-                return key;
-            } else {
-                Log.e(TAG, "deriveKeyArgon2: crypto_pwhash returned " + result);
+            if (!success) {
+                Log.e(TAG, "deriveKeyArgon2id: crypto_pwhash failed");
                 return null;
             }
+            return key;
         } catch (Exception e) {
-            Log.e(TAG, "deriveKeyArgon2 failed: " + e.getMessage());
+            Log.e(TAG, "deriveKeyArgon2id failed: " + e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Alias for deriveKeyArgon2 -- used as the primary deriveMasterKey.
-     */
-    public static byte[] deriveMasterKey(String password, byte[] salt) {
-        return deriveKeyArgon2(password, salt);
-    }
+    // ======================== XChaCha20-Poly1305 NOTE ENCRYPTION ========================
 
     /**
-     * Derive legacy key for PBKDF2 migration ONLY. Uses old 120,000 iterations.
-     */
-    public static byte[] deriveLegacyKey(String password, byte[] salt) {
-        if (password == null || salt == null) return null;
-        javax.crypto.spec.PBEKeySpec spec = null;
-        try {
-            spec = new javax.crypto.spec.PBEKeySpec(
-                    password.toCharArray(), salt, FIXED_ITERATIONS, KEY_LENGTH_BYTES * 8);
-            javax.crypto.SecretKeyFactory factory =
-                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
-            return factory.generateSecret(spec).getEncoded();
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (spec != null) spec.clearPassword();
-        }
-    }
-
-    /**
-     * Derive legacy key with old 15,000 iterations for v1 migration.
-     */
-    public static byte[] deriveLegacyKeyV1(String password, byte[] salt) {
-        if (password == null || salt == null) return null;
-        javax.crypto.spec.PBEKeySpec spec = null;
-        try {
-            spec = new javax.crypto.spec.PBEKeySpec(
-                    password.toCharArray(), salt, LEGACY_ITERATIONS, KEY_LENGTH_BYTES * 8);
-            javax.crypto.SecretKeyFactory factory =
-                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
-            return factory.generateSecret(spec).getEncoded();
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (spec != null) spec.clearPassword();
-        }
-    }
-
-    // ======================== XCHACHA20-POLY1305 ENCRYPTION ========================
-
-    /**
-     * Encrypt plaintext using XChaCha20-Poly1305.
-     * Returns JSON cipher string: {"alg":"xcha-argon2id13","ct":"base64","iv":"base64","len":N}
-     *
-     * @param plaintext text to encrypt
-     * @param key       byte[32] encryption key (UEK)
-     * @return JSON cipher string, or "" for null/empty input, or null on failure
+     * Encrypt plaintext using XChaCha20-Poly1305 IETF.
+     * Format: "xcha:{base64_nonce}:{base64_ciphertext_with_tag}"
+     * Used for note field encryption with the DEK.
      */
     public static String encrypt(String plaintext, byte[] key) {
-        if (plaintext == null || plaintext.length() == 0) {
-            return "";
-        }
-        if (key == null || key.length != KEY_LENGTH_BYTES) {
-            Log.e(TAG, "encrypt: invalid key");
-            return null;
-        }
+        if (plaintext == null || plaintext.length() == 0) return "";
+        if (key == null || key.length != KEY_LENGTH_BYTES) return null;
         try {
-            byte[] message = plaintext.getBytes(StandardCharsets.UTF_8);
-            byte[] nonce = new byte[XCHACHA_NONCE_LENGTH];
+            byte[] nonce = new byte[XCHACHA_NONCE_BYTES];
             sRandom.nextBytes(nonce);
 
-            // Output buffer: message + tag (16 bytes)
-            byte[] ciphertext = new byte[message.length + XCHACHA_TAG_LENGTH];
-            long[] ciphertextLen = new long[1];  // Changed from int[] to long[]
+            byte[] plaintextBytes = plaintext.getBytes(StandardCharsets.UTF_8);
+            byte[] ciphertext     = new byte[plaintextBytes.length + XCHACHA_TAG_BYTES];
+            int[]  ciphertextLen  = new int[1];
 
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
                     ciphertext, ciphertextLen,
-                    message, message.length,
-                    null, 0,  // no additional data
-                    null,     // nsec (unused in IETF)
-                    nonce,
-                    key
-            );
+                    plaintextBytes, plaintextBytes.length,
+                    null, 0,   // no additional data
+                    null,      // nsec (unused)
+                    nonce, key);
 
-            if (result != 0) {  // Check for success (0 = success)
-                Log.e(TAG, "encrypt: crypto_aead_xchacha20poly1305_ietf_encrypt failed with result: " + result);
+            if (!success) {
+                Log.e(TAG, "encrypt: xchacha20poly1305 encrypt failed");
                 return null;
             }
 
-            // Build JSON cipher format
-            String ctB64 = Base64.encodeToString(ciphertext, 0, (int) ciphertextLen[0], Base64.NO_WRAP);
-            String ivB64 = Base64.encodeToString(nonce, Base64.NO_WRAP);
+            String nonceB64 = Base64.encodeToString(nonce, Base64.NO_WRAP);
+            int    ctLen    = ciphertextLen[0] > 0 ? ciphertextLen[0] : ciphertext.length;
+            byte[] actualCt = ctLen < ciphertext.length ? Arrays.copyOf(ciphertext, ctLen) : ciphertext;
+            String ctB64    = Base64.encodeToString(actualCt, Base64.NO_WRAP);
 
-            return "{\"alg\":\"" + ALG_IDENTIFIER + "\","
-                    + "\"ct\":\"" + ctB64 + "\","
-                    + "\"iv\":\"" + ivB64 + "\","
-                    + "\"len\":" + message.length + "}";
-
+            return XCHA_PREFIX + nonceB64 + ":" + ctB64;
         } catch (Exception e) {
             Log.e(TAG, "encrypt failed: " + e.getMessage());
             return null;
@@ -265,175 +187,186 @@ public final class CryptoManager {
     }
 
     /**
-     * Decrypt ciphertext. Auto-detects format:
-     * - New JSON format: {"alg":"xcha-argon2id13",...}
-     * - Old hex format: "ivHex:ciphertextHex" (AES-GCM, for migration)
-     *
-     * @param encryptedData encrypted string
-     * @param key           byte[32] encryption key
-     * @return decrypted plaintext, original data if not encrypted, null on decrypt failure
+     * Decrypt data encrypted with XChaCha20-Poly1305.
+     * Supports both new "xcha:" format and old "ivHex:ciphertextHex" format.
      */
     public static String decrypt(String encryptedData, byte[] key) {
-        if (encryptedData == null || encryptedData.length() == 0) {
-            return "";
-        }
-        if (key == null) {
-            return null;
+        if (encryptedData == null || encryptedData.length() == 0) return "";
+        if (key == null) return null;
+
+        if (encryptedData.startsWith(XCHA_PREFIX)) {
+            return decryptXChaCha(encryptedData, key);
         }
 
-        // Detect format
-        String trimmed = encryptedData.trim();
-        if (trimmed.startsWith("{\"alg\":\"")) {
-            return decryptXChaCha(trimmed, key);
-        } else if (isOldEncryptedFormat(trimmed)) {
-            return decryptOldAesGcm(trimmed, key);
-        } else {
-            // Not encrypted, return as-is (plaintext legacy data)
-            return encryptedData;
+        if (isOldEncrypted(encryptedData)) {
+            return decryptOldAesGcm(encryptedData, key);
         }
+
+        // Not encrypted -- return as-is
+        return encryptedData;
     }
 
-    /**
-     * Decrypt XChaCha20-Poly1305 JSON cipher format.
-     */
-    private static String decryptXChaCha(String jsonCipher, byte[] key) {
+    private static String decryptXChaCha(String encryptedData, byte[] key) {
         try {
-            // Simple JSON parsing (no external library needed)
-            String ctB64 = extractJsonValue(jsonCipher, "ct");
-            String ivB64 = extractJsonValue(jsonCipher, "iv");
+            String payload  = encryptedData.substring(XCHA_PREFIX.length());
+            int    colonIdx = payload.indexOf(':');
+            if (colonIdx <= 0) return null;
 
-            if (ctB64 == null || ivB64 == null) {
-                Log.e(TAG, "decryptXChaCha: missing ct or iv");
-                return null;
-            }
+            byte[] nonce      = Base64.decode(payload.substring(0, colonIdx), Base64.NO_WRAP);
+            byte[] ciphertext = Base64.decode(payload.substring(colonIdx + 1), Base64.NO_WRAP);
 
-            byte[] ciphertext = Base64.decode(ctB64, Base64.NO_WRAP);
-            byte[] nonce = Base64.decode(ivB64, Base64.NO_WRAP);
-
-            if (nonce.length != XCHACHA_NONCE_LENGTH) {
+            if (nonce.length != XCHACHA_NONCE_BYTES) {
                 Log.e(TAG, "decryptXChaCha: invalid nonce length=" + nonce.length);
                 return null;
             }
 
-            // Output buffer: ciphertext - tag (16 bytes)
-            byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            long[] plaintextLen = new long[1];  // Changed from int[] to long[]
+            byte[] plaintext    = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
+            int[]  plaintextLen = new int[1];
 
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
                     plaintext, plaintextLen,
-                    null,     // nsec (unused)
+                    null,
                     ciphertext, ciphertext.length,
-                    null, 0,  // no additional data
-                    nonce,
-                    key
-            );
+                    null, 0,
+                    nonce, key);
 
-            if (result != 0) {  // Check for success (0 = success)
-                Log.w(TAG, "decryptXChaCha: decryption failed (wrong key or tampered) with result: " + result);
+            if (!success) {
+                Log.w(TAG, "decryptXChaCha: authentication failed (wrong key or tampered)");
                 return null;
             }
 
-            return new String(plaintext, 0, (int) plaintextLen[0], StandardCharsets.UTF_8);
-
+            int ptLen = plaintextLen[0] > 0 ? plaintextLen[0] : plaintext.length;
+            return new String(plaintext, 0, ptLen, StandardCharsets.UTF_8);
         } catch (Exception e) {
             Log.e(TAG, "decryptXChaCha failed: " + e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Decrypt old AES-256-GCM format (ivHex:ciphertextHex) for backward compatibility.
-     */
-    private static String decryptOldAesGcm(String encryptedData, byte[] key) {
-        try {
-            int colonIdx = encryptedData.indexOf(':');
-            if (colonIdx <= 0) return encryptedData;
-
-            String ivHex = encryptedData.substring(0, colonIdx);
-            String cipherHex = encryptedData.substring(colonIdx + 1);
-
-            byte[] iv = hexToBytes(ivHex);
-            byte[] ciphertext = hexToBytes(cipherHex);
-
-            javax.crypto.spec.SecretKeySpec keySpec =
-                    new javax.crypto.spec.SecretKeySpec(key, "AES");
-            javax.crypto.spec.GCMParameterSpec gcmSpec =
-                    new javax.crypto.spec.GCMParameterSpec(128, iv);
-            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, keySpec, gcmSpec);
-            byte[] plainBytes = cipher.doFinal(ciphertext);
-
-            return new String(plainBytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            // Decryption failed
-            return null;
-        }
-    }
-
-    /**
-     * Safe decrypt with fallback marker for UI display.
-     */
-    public static final String DECRYPT_FAILED_MARKER = "[DECRYPTION_FAILED]";
-
-    public static String decryptSafe(String encryptedData, byte[] key) {
-        if (encryptedData == null || encryptedData.length() == 0) {
-            return "";
-        }
-        if (key == null) {
-            if (isEncrypted(encryptedData)) {
-                return DECRYPT_FAILED_MARKER;
-            }
+    public static String decryptSafe(String encryptedData, byte[] dek) {
+        if (encryptedData == null || encryptedData.length() == 0) return "";
+        if (dek == null) {
+            if (isEncrypted(encryptedData)) return DECRYPT_FAILED_MARKER;
             return encryptedData;
         }
-        String result = decrypt(encryptedData, key);
-        if (result == null) {
-            return DECRYPT_FAILED_MARKER;
-        }
+        String result = decrypt(encryptedData, dek);
+        if (result == null) return DECRYPT_FAILED_MARKER;
         return result;
     }
 
-    // ======================== DEK WRAPPING (XChaCha20-Poly1305) ========================
+    // ======================== DEK WRAPPING WITH DERIVED KEY (NEW v4) ========================
 
     /**
-     * Encrypt DEK/UEK with a wrapping key using XChaCha20-Poly1305.
-     * Returns a VaultBundle with Base64-encoded ct, iv (nonce).
+     * NEW v4: Encrypt DEK with password-derived key using XChaCha20-Poly1305.
+     * This replaces the old DB Key wrapping. The derivedKey comes from
+     * Argon2id(password, salt) which is deterministic and device-independent.
      *
-     * @param dek       byte[32] data encryption key to wrap
-     * @param wrapKey   byte[32] wrapping key (DB key or master key)
-     * @return VaultBundle with Base64 encoded fields, or null on failure
+     * @param dek        byte[32] random Data Encryption Key
+     * @param derivedKey byte[32] from Argon2id(password, salt)
+     * @return VaultBundle with base64 nonce and ciphertext, or null on failure
      */
-    public static VaultBundle encryptDEK(byte[] dek, byte[] wrapKey) {
-        if (dek == null || wrapKey == null) {
-            Log.e(TAG, "encryptDEK: null input");
-            return null;
-        }
+    public static VaultBundle encryptDEKWithDerivedKey(byte[] dek, byte[] derivedKey) {
+        if (dek == null || derivedKey == null) return null;
         try {
-            byte[] nonce = new byte[XCHACHA_NONCE_LENGTH];
+            byte[] nonce = new byte[XCHACHA_NONCE_BYTES];
             sRandom.nextBytes(nonce);
 
-            byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_LENGTH];
-            long[] ciphertextLen = new long[1];  // Changed from int[] to long[]
+            byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_BYTES];
+            int[]  ctLen      = new int[1];
 
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
-                    ciphertext, ciphertextLen,
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+                    ciphertext, ctLen,
                     dek, dek.length,
-                    null, 0,
-                    null,
-                    nonce,
-                    wrapKey
-            );
+                    null, 0, null, nonce, derivedKey);
 
-            if (result != 0) {  // Check for success (0 = success)
-                Log.e(TAG, "encryptDEK: encryption failed with result: " + result);
+            if (!success) {
+                Log.e(TAG, "encryptDEKWithDerivedKey: encrypt failed");
                 return null;
             }
 
             VaultBundle bundle = new VaultBundle();
-            bundle.encryptedDEK = Base64.encodeToString(ciphertext, 0, (int) ciphertextLen[0], Base64.NO_WRAP);
-            bundle.iv = Base64.encodeToString(nonce, Base64.NO_WRAP);
-            bundle.tag = ""; // Tag is embedded in ciphertext for XChaCha20-Poly1305
+            bundle.encryptedDEK = Base64.encodeToString(ciphertext, Base64.NO_WRAP);
+            bundle.iv           = Base64.encodeToString(nonce, Base64.NO_WRAP);
+            bundle.tag          = "xchacha20poly1305"; // Algorithm marker
             return bundle;
+        } catch (Exception e) {
+            Log.e(TAG, "encryptDEKWithDerivedKey failed: " + e.getMessage());
+            return null;
+        }
+    }
 
+    /**
+     * NEW v4: Decrypt DEK using password-derived key (XChaCha20-Poly1305).
+     * If decrypt fails, password is wrong (auth tag mismatch).
+     *
+     * @param encryptedDEKBase64 Base64-encoded encrypted DEK
+     * @param ivBase64           Base64-encoded 24-byte nonce
+     * @param derivedKey         byte[32] from Argon2id(password, salt)
+     * @return byte[32] DEK, or null if password wrong / tampered
+     */
+    public static byte[] decryptDEKWithDerivedKey(String encryptedDEKBase64,
+                                                   String ivBase64,
+                                                   byte[] derivedKey) {
+        if (encryptedDEKBase64 == null || ivBase64 == null || derivedKey == null) return null;
+        try {
+            byte[] nonce      = Base64.decode(ivBase64, Base64.NO_WRAP);
+            byte[] ciphertext = Base64.decode(encryptedDEKBase64, Base64.NO_WRAP);
+
+            if (nonce.length != XCHACHA_NONCE_BYTES) {
+                Log.e(TAG, "decryptDEKWithDerivedKey: invalid nonce length=" + nonce.length);
+                return null;
+            }
+
+            byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
+            int[]  ptLen     = new int[1];
+
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    plaintext, ptLen,
+                    null, ciphertext, ciphertext.length,
+                    null, 0, nonce, derivedKey);
+
+            if (!success) {
+                Log.w(TAG, "decryptDEKWithDerivedKey: auth failed -- wrong password");
+                return null;
+            }
+            if (plaintext.length != KEY_LENGTH_BYTES) {
+                Log.e(TAG, "decryptDEKWithDerivedKey: unexpected DEK length=" + plaintext.length);
+                zeroFill(plaintext);
+                return null;
+            }
+            return plaintext;
+        } catch (Exception e) {
+            Log.e(TAG, "decryptDEKWithDerivedKey failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ======================== OLD DEK WRAPPING (LEGACY - kept for migration) ========================
+
+    /**
+     * OLD: Encrypt DEK with DB key using XChaCha20-Poly1305.
+     * DEPRECATED: Only used during migration from old vault format.
+     */
+    public static VaultBundle encryptDEK(byte[] dek, byte[] wrappingKey) {
+        if (dek == null || wrappingKey == null) return null;
+        try {
+            byte[] nonce      = new byte[XCHACHA_NONCE_BYTES];
+            sRandom.nextBytes(nonce);
+            byte[] ciphertext = new byte[dek.length + XCHACHA_TAG_BYTES];
+            int[]  ctLen      = new int[1];
+
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
+                    ciphertext, ctLen,
+                    dek, dek.length,
+                    null, 0, null, nonce, wrappingKey);
+
+            if (!success) return null;
+
+            VaultBundle bundle = new VaultBundle();
+            bundle.encryptedDEK = Base64.encodeToString(ciphertext, Base64.NO_WRAP);
+            bundle.iv           = Base64.encodeToString(nonce, Base64.NO_WRAP);
+            bundle.tag          = "xchacha20poly1305";
+            return bundle;
         } catch (Exception e) {
             Log.e(TAG, "encryptDEK failed: " + e.getMessage());
             return null;
@@ -441,263 +374,164 @@ public final class CryptoManager {
     }
 
     /**
-     * Decrypt DEK/UEK with a wrapping key using XChaCha20-Poly1305.
-     *
-     * @param encryptedDEKBase64 Base64-encoded ciphertext (with embedded tag)
-     * @param ivBase64           Base64-encoded nonce (24 bytes)
-     * @param tagBase64          unused for XChaCha20 (tag is embedded), kept for API compat
-     * @param wrapKey            byte[32] wrapping key
-     * @return byte[32] DEK on success, null on failure
+     * OLD: Decrypt DEK using XChaCha20-Poly1305 or AES-256-GCM.
+     * DEPRECATED: Only used for migration path from old vault format.
      */
     public static byte[] decryptDEK(String encryptedDEKBase64, String ivBase64,
-                                     String tagBase64, byte[] wrapKey) {
-        if (encryptedDEKBase64 == null || ivBase64 == null || wrapKey == null) {
-            Log.e(TAG, "decryptDEK: null input");
-            return null;
+                                     String tagBase64, byte[] wrappingKey) {
+        if (encryptedDEKBase64 == null || ivBase64 == null || wrappingKey == null) return null;
+
+        if ("xchacha20poly1305".equals(tagBase64)) {
+            return decryptDEKXChaCha(encryptedDEKBase64, ivBase64, wrappingKey);
         }
+
+        return decryptDEKOldAesGcm(encryptedDEKBase64, ivBase64, tagBase64, wrappingKey);
+    }
+
+    private static byte[] decryptDEKXChaCha(String encDEKB64, String nonceB64, byte[] key) {
         try {
-            byte[] ciphertext = Base64.decode(encryptedDEKBase64, Base64.NO_WRAP);
-            byte[] nonce = Base64.decode(ivBase64, Base64.NO_WRAP);
+            byte[] nonce      = Base64.decode(nonceB64, Base64.NO_WRAP);
+            byte[] ciphertext = Base64.decode(encDEKB64, Base64.NO_WRAP);
 
-            if (nonce.length != XCHACHA_NONCE_LENGTH) {
-                // Try old AES-GCM format (12-byte IV)
-                if (nonce.length == OLD_GCM_IV_LENGTH) {
-                    return decryptDEKOldAesGcm(encryptedDEKBase64, ivBase64, tagBase64, wrapKey);
-                }
-                Log.e(TAG, "decryptDEK: invalid nonce length=" + nonce.length);
+            byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_BYTES];
+            int[]  ptLen     = new int[1];
+
+            boolean success = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    plaintext, ptLen,
+                    null, ciphertext, ciphertext.length,
+                    null, 0, nonce, key);
+
+            if (!success) {
+                Log.w(TAG, "decryptDEKXChaCha: auth failed -- wrong key");
                 return null;
             }
-
-            byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            long[] plaintextLen = new long[1];  // Changed from int[] to long[]
-
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
-                    plaintext, plaintextLen,
-                    null,
-                    ciphertext, ciphertext.length,
-                    null, 0,
-                    nonce,
-                    wrapKey
-            );
-
-            if (result != 0) {  // Check for success (0 = success)
-                Log.w(TAG, "decryptDEK: decryption failed -- wrong key or tampered with result: " + result);
+            if (plaintext.length != KEY_LENGTH_BYTES) {
+                Log.e(TAG, "decryptDEKXChaCha: unexpected DEK length=" + plaintext.length);
+                zeroFill(plaintext);
                 return null;
             }
-
-            if (plaintextLen[0] != KEY_LENGTH_BYTES) {
-                Log.e(TAG, "decryptDEK: unexpected DEK length=" + plaintextLen[0]);
-                return null;
-            }
-
-            byte[] resultBytes = new byte[KEY_LENGTH_BYTES];
-            System.arraycopy(plaintext, 0, resultBytes, 0, KEY_LENGTH_BYTES);
-            zeroFill(plaintext);
-            return resultBytes;
-
+            return plaintext;
         } catch (Exception e) {
-            Log.e(TAG, "decryptDEK failed: " + e.getMessage());
+            Log.e(TAG, "decryptDEKXChaCha failed: " + e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Decrypt DEK using OLD AES-256-GCM format (for migration from old vault).
-     */
+    // ======================== LEGACY AES-GCM (migration only) ========================
+
     private static byte[] decryptDEKOldAesGcm(String encDEKB64, String ivB64,
                                                 String tagB64, byte[] masterKey) {
         try {
             byte[] ciphertext = Base64.decode(encDEKB64, Base64.NO_WRAP);
-            byte[] iv = Base64.decode(ivB64, Base64.NO_WRAP);
-            byte[] tag = tagB64 != null && tagB64.length() > 0
-                    ? Base64.decode(tagB64, Base64.NO_WRAP)
-                    : new byte[0];
+            byte[] iv         = Base64.decode(ivB64, Base64.NO_WRAP);
+            byte[] tag        = Base64.decode(tagB64, Base64.NO_WRAP);
 
-            // Reassemble ciphertext + tag for Java GCM
-            byte[] combined;
-            if (tag.length > 0) {
-                combined = new byte[ciphertext.length + tag.length];
-                System.arraycopy(ciphertext, 0, combined, 0, ciphertext.length);
-                System.arraycopy(tag, 0, combined, ciphertext.length, tag.length);
-            } else {
-                combined = ciphertext;
+            if (iv.length != GCM_IV_LENGTH) return null;
+
+            byte[] ciphertextWithTag = new byte[ciphertext.length + tag.length];
+            System.arraycopy(ciphertext, 0, ciphertextWithTag, 0, ciphertext.length);
+            System.arraycopy(tag, 0, ciphertextWithTag, ciphertext.length, tag.length);
+
+            SecretKeySpec  keySpec = new SecretKeySpec(masterKey, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+            byte[] dek = cipher.doFinal(ciphertextWithTag);
+
+            if (dek.length != KEY_LENGTH_BYTES) {
+                zeroFill(dek);
+                return null;
             }
-
-            javax.crypto.spec.SecretKeySpec keySpec =
-                    new javax.crypto.spec.SecretKeySpec(masterKey, "AES");
-            javax.crypto.spec.GCMParameterSpec gcmSpec =
-                    new javax.crypto.spec.GCMParameterSpec(128, iv);
-            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, keySpec, gcmSpec);
-
-            return cipher.doFinal(combined);
+            return dek;
+        } catch (javax.crypto.AEADBadTagException e) {
+            Log.w(TAG, "decryptDEKOldAesGcm: wrong password");
+            return null;
         } catch (Exception e) {
             Log.e(TAG, "decryptDEKOldAesGcm failed: " + e.getMessage());
             return null;
         }
     }
 
-    /**
-     * Decrypt data using a legacy key (old CryptoUtils single-layer system).
-     * Same AES-256-GCM format (ivHex:ciphertextHex).
-     */
+    private static String decryptOldAesGcm(String encryptedData, byte[] key) {
+        try {
+            int    colonIdx  = encryptedData.indexOf(':');
+            if (colonIdx <= 0) return encryptedData;
+            String ivHex     = encryptedData.substring(0, colonIdx);
+            String cipherHex = encryptedData.substring(colonIdx + 1);
+            if (ivHex.length() != GCM_IV_LENGTH * 2) return encryptedData;
+
+            byte[] iv         = hexToBytes(ivHex);
+            byte[] ciphertext = hexToBytes(cipherHex);
+
+            SecretKeySpec    keySpec = new SecretKeySpec(key, "AES");
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec);
+            byte[] plainBytes = cipher.doFinal(ciphertext);
+            return new String(plainBytes, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static byte[] deriveMasterKey(String password, byte[] salt) {
+        if (password == null || salt == null) return null;
+        try {
+            javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(
+                    password.toCharArray(), salt, FIXED_ITERATIONS, 256);
+            javax.crypto.SecretKeyFactory factory =
+                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            byte[] key = factory.generateSecret(spec).getEncoded();
+            spec.clearPassword();
+            return key;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static byte[] deriveLegacyKey(String password, byte[] salt) {
+        if (password == null || salt == null) return null;
+        try {
+            javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(
+                    password.toCharArray(), salt, LEGACY_ITERATIONS, 256);
+            javax.crypto.SecretKeyFactory factory =
+                    javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            byte[] key = factory.generateSecret(spec).getEncoded();
+            spec.clearPassword();
+            return key;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public static String decryptWithLegacyKey(String encryptedData, byte[] legacyKey) {
         return decryptOldAesGcm(encryptedData, legacyKey);
     }
 
-    // ======================== RAW BYTE ENCRYPTION ========================
+    // ======================== DETECTION ========================
 
-    /**
-     * Encrypt raw bytes using XChaCha20-Poly1305.
-     *
-     * @param data plaintext bytes
-     * @param key  byte[32] encryption key
-     * @return EncryptedBlob with ciphertext and nonce, or null on failure
-     */
-    public static EncryptedBlob encryptBytes(byte[] data, byte[] key) {
-        if (data == null || key == null) return null;
-        try {
-            byte[] nonce = new byte[XCHACHA_NONCE_LENGTH];
-            sRandom.nextBytes(nonce);
-
-            byte[] ciphertext = new byte[data.length + XCHACHA_TAG_LENGTH];
-            long[] ciphertextLen = new long[1];  // Changed from int[] to long[]
-
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_encrypt(
-                    ciphertext, ciphertextLen,
-                    data, data.length,
-                    null, 0,
-                    null,
-                    nonce,
-                    key
-            );
-
-            if (result != 0) return null;
-
-            EncryptedBlob blob = new EncryptedBlob();
-            blob.ciphertext = Arrays.copyOf(ciphertext, (int) ciphertextLen[0]);
-            blob.nonce = nonce;
-            return blob;
-
-        } catch (Exception e) {
-            Log.e(TAG, "encryptBytes failed: " + e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Decrypt raw bytes using XChaCha20-Poly1305.
-     *
-     * @param ciphertext encrypted bytes (including tag)
-     * @param nonce      24-byte nonce
-     * @param key        byte[32] encryption key
-     * @return plaintext bytes, or null on failure
-     */
-    public static byte[] decryptBytes(byte[] ciphertext, byte[] nonce, byte[] key) {
-        if (ciphertext == null || nonce == null || key == null) return null;
-        try {
-            byte[] plaintext = new byte[ciphertext.length - XCHACHA_TAG_LENGTH];
-            long[] plaintextLen = new long[1];  // Changed from int[] to long[]
-
-            int result = getSodium().crypto_aead_xchacha20poly1305_ietf_decrypt(
-                    plaintext, plaintextLen,
-                    null,
-                    ciphertext, ciphertext.length,
-                    null, 0,
-                    nonce,
-                    key
-            );
-
-            if (result != 0) return null;
-            return Arrays.copyOf(plaintext, (int) plaintextLen[0]);
-
-        } catch (Exception e) {
-            Log.e(TAG, "decryptBytes failed: " + e.getMessage());
-            return null;
-        }
-    }
-
-    // ======================== FORMAT DETECTION ========================
-
-    /**
-     * Check if a string looks like encrypted data.
-     * Supports both new JSON format and old hex format.
-     */
     public static boolean isEncrypted(String data) {
-        if (data == null || data.length() == 0) {
-            return false;
-        }
-        String trimmed = data.trim();
-        // New JSON format
-        if (trimmed.startsWith("{\"alg\":\"")) {
-            return true;
-        }
-        // Old hex format
-        return isOldEncryptedFormat(trimmed);
+        if (data == null || data.length() == 0) return false;
+        if (data.startsWith(XCHA_PREFIX)) return true;
+        return isOldEncrypted(data);
     }
 
-    /**
-     * Check if data is in old AES-GCM hex format (ivHex:ciphertextHex).
-     */
-    private static boolean isOldEncryptedFormat(String data) {
+    public static boolean isOldEncrypted(String data) {
         if (data == null || data.length() == 0) return false;
         int colonIdx = data.indexOf(':');
-        if (colonIdx != OLD_GCM_IV_LENGTH * 2) return false;
+        if (colonIdx != GCM_IV_LENGTH * 2) return false;
         String ivPart = data.substring(0, colonIdx);
         for (int i = 0; i < ivPart.length(); i++) {
             char c = ivPart.charAt(i);
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
-                return false;
-            }
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
         }
         return true;
     }
 
     // ======================== MEMORY SAFETY ========================
 
-    /**
-     * Zero-fill a byte array to prevent key material from lingering in memory.
-     */
     public static void zeroFill(byte[] data) {
-        if (data != null) {
-            Arrays.fill(data, (byte) 0);
-        }
-    }
-
-    // ======================== JSON UTILITY ========================
-
-    /**
-     * Extract a string value from a simple JSON object.
-     * Handles: {"key":"value", ...}
-     */
-    static String extractJsonValue(String json, String key) {
-        String searchKey = "\"" + key + "\":\"";
-        int start = json.indexOf(searchKey);
-        if (start < 0) return null;
-        start += searchKey.length();
-        int end = json.indexOf("\"", start);
-        if (end < 0) return null;
-        return json.substring(start, end);
-    }
-
-    /**
-     * Extract an integer value from a simple JSON object.
-     * Handles: {"key":123, ...}
-     */
-    static int extractJsonInt(String json, String key) {
-        String searchKey = "\"" + key + "\":";
-        int start = json.indexOf(searchKey);
-        if (start < 0) return -1;
-        start += searchKey.length();
-        int end = start;
-        while (end < json.length() && (Character.isDigit(json.charAt(end)))) {
-            end++;
-        }
-        try {
-            return Integer.parseInt(json.substring(start, end));
-        } catch (NumberFormatException e) {
-            return -1;
-        }
+        if (data != null) Arrays.fill(data, (byte) 0);
     }
 
     // ======================== HEX UTILITY ========================
@@ -715,7 +549,7 @@ public final class CryptoManager {
 
     public static byte[] hexToBytes(String hex) {
         if (hex == null || hex.length() == 0) return new byte[0];
-        int len = hex.length();
+        int    len  = hex.length();
         byte[] data = new byte[len / 2];
         for (int i = 0; i < len; i += 2) {
             data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
@@ -724,22 +558,11 @@ public final class CryptoManager {
         return data;
     }
 
-    // ======================== DATA CLASSES ========================
+    // ======================== VAULT BUNDLE ========================
 
-    /**
-     * Holds the result of DEK encryption for vault storage.
-     */
     public static class VaultBundle {
-        public String encryptedDEK; // Base64 ciphertext (with embedded Poly1305 tag)
-        public String iv;           // Base64 nonce (24 bytes)
-        public String tag;          // Empty for XChaCha20 (tag is embedded), kept for API compat
-    }
-
-    /**
-     * Holds encrypted raw bytes with nonce.
-     */
-    public static class EncryptedBlob {
-        public byte[] ciphertext;
-        public byte[] nonce;
+        public String encryptedDEK;
+        public String iv;
+        public String tag;
     }
 }
