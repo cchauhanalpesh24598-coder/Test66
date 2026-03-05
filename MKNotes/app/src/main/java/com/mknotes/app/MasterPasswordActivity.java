@@ -30,6 +30,20 @@ import com.mknotes.app.util.SessionManager;
 /**
  * Gatekeeper activity: master password CREATE or UNLOCK.
  *
+ * v4 ARCHITECTURE UPDATE:
+ * =======================
+ * Ab vault unlock SIRF password-derived key se hota hai.
+ * DB Key (Keystore-wrapped) vault unlock chain me NAHI hai.
+ *
+ * Clear Data Recovery Flow:
+ * 1. User clears app data -> Keystore + SharedPrefs deleted
+ * 2. User logs in again -> Firebase login
+ * 3. Vault metadata fetched from Firestore (salt, encryptedDEK, iv)
+ * 4. User enters same password
+ * 5. Argon2id(password, salt) -> same derivedKey (DETERMINISTIC)
+ * 6. derivedKey decrypts encryptedDEK -> DEK recovered
+ * 7. Notes decrypt with DEK -> SUCCESS!
+ *
  * Flow:
  * 1. If vault initialized + unlocked + session valid -> skip to main
  * 2. If vault initialized locally -> UNLOCK mode
@@ -38,22 +52,12 @@ import com.mknotes.app.util.SessionManager;
  *    b. No vault + no notes -> CREATE mode (fresh user)
  *    c. No vault + notes exist -> LEGACY RECOVERY mode
  * 4. If not logged in -> CREATE mode (offline use)
- *
- * REINSTALL/CLEAR-DATA PROOF: Vault metadata stored in Firestore at
- * users/{uid}/crypto_metadata/vault. On reinstall or Clear Data,
- * vault is fetched from Firestore and UEK is recovered using
- * password-derived key (PK) -- no device-local DBK needed.
- *
- * CHANGE LOG v4:
- * - handleUnlock() now shows "Recovering vault..." for PATH B (PK recovery)
- *   when DBK wrapping is missing (Clear Data scenario)
- * - No other changes needed -- KeyManager.unlockVault() handles dual-path
  */
 public class MasterPasswordActivity extends Activity {
 
     private static final String TAG = "MasterPasswordActivity";
-    private static final int MODE_CREATE = 0;
-    private static final int MODE_UNLOCK = 1;
+    private static final int MODE_CREATE          = 0;
+    private static final int MODE_UNLOCK          = 1;
     private static final int MODE_LEGACY_RECOVERY = 2;
 
     private int currentMode;
@@ -66,14 +70,14 @@ public class MasterPasswordActivity extends Activity {
     private EditText editConfirmPassword;
     private TextView textError;
     private TextView textStrengthHint;
-    private Button btnAction;
+    private Button   btnAction;
     private CheckBox cbShowPassword;
 
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         sessionManager = SessionManager.getInstance(this);
-        keyManager = KeyManager.getInstance(this);
+        keyManager     = KeyManager.getInstance(this);
 
         // If vault is initialized, unlocked, and session valid -> skip
         if (keyManager.isVaultInitialized() && keyManager.isVaultUnlocked()
@@ -108,7 +112,7 @@ public class MasterPasswordActivity extends Activity {
             // Old system password exists -- needs migration
             setupUnlockMode();
         } else {
-            // Check Firestore for vault (reinstall scenario)
+            // Check Firestore for vault (reinstall / clear data scenario)
             checkFirestoreVault();
         }
     }
@@ -122,14 +126,14 @@ public class MasterPasswordActivity extends Activity {
     }
 
     private void initViews() {
-        toolbarTitle = (TextView) findViewById(R.id.toolbar_title);
-        textSubtitle = (TextView) findViewById(R.id.text_subtitle);
-        editPassword = (EditText) findViewById(R.id.edit_password);
+        toolbarTitle       = (TextView) findViewById(R.id.toolbar_title);
+        textSubtitle       = (TextView) findViewById(R.id.text_subtitle);
+        editPassword       = (EditText) findViewById(R.id.edit_password);
         editConfirmPassword = (EditText) findViewById(R.id.edit_confirm_password);
-        textError = (TextView) findViewById(R.id.text_error);
-        textStrengthHint = (TextView) findViewById(R.id.text_strength_hint);
-        btnAction = (Button) findViewById(R.id.btn_action);
-        cbShowPassword = (CheckBox) findViewById(R.id.cb_show_password);
+        textError          = (TextView) findViewById(R.id.text_error);
+        textStrengthHint   = (TextView) findViewById(R.id.text_strength_hint);
+        btnAction          = (Button)   findViewById(R.id.btn_action);
+        cbShowPassword     = (CheckBox) findViewById(R.id.cb_show_password);
 
         if (cbShowPassword != null) {
             cbShowPassword.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
@@ -157,10 +161,9 @@ public class MasterPasswordActivity extends Activity {
     // ======================== FIRESTORE VAULT CHECK ========================
 
     /**
-     * Check Firestore for vault metadata (reinstall scenario).
-     * FIX v2.2: Uses 3-state callback to distinguish "no vault" from "network error".
+     * Check Firestore for vault metadata (reinstall / clear data scenario).
+     * Uses 3-state callback to distinguish "no vault" from "network error".
      * On NETWORK_ERROR: shows retry message, NEVER allows vault creation.
-     * This prevents accidental DEK regeneration on poor/slow network.
      */
     private void checkFirestoreVault() {
         if (keyManager.isVaultInitialized()) {
@@ -204,7 +207,7 @@ public class MasterPasswordActivity extends Activity {
 
     /**
      * SAFETY: Check if notes exist before allowing vault creation.
-     * FIX v2.2: Uses 3-state callback. NETWORK_ERROR blocks vault creation.
+     * NETWORK_ERROR blocks vault creation.
      */
     private void checkCloudNotesBeforeCreate() {
         keyManager.checkCloudNotesExistWithResult(new KeyManager.VaultFetchResultCallback() {
@@ -213,17 +216,14 @@ public class MasterPasswordActivity extends Activity {
                     public void run() {
                         switch (result) {
                             case VAULT_FOUND:
-                                // VAULT_FOUND here means "notes exist but vault missing"
                                 Log.d(TAG, "[LEGACY_DETECTED] Notes exist but vault missing");
                                 setupLegacyRecoveryMode();
                                 break;
                             case NO_VAULT_EXISTS:
-                                // Server confirms: no notes AND no vault -- truly fresh user
                                 Log.d(TAG, "[FRESH_USER] No notes, no vault, allowing CREATE");
                                 setupCreateMode();
                                 break;
                             case NETWORK_ERROR:
-                                // Cannot confirm state -- block vault creation
                                 Log.w(TAG, "[NOTES_CHECK] NETWORK_ERROR -- blocking vault creation");
                                 setupNetworkErrorMode();
                                 break;
@@ -235,9 +235,8 @@ public class MasterPasswordActivity extends Activity {
     }
 
     /**
-     * FIX v2.2: Network error mode -- shown when we cannot reach Firestore
-     * to confirm whether a vault exists. NEVER allows vault creation.
-     * User must connect to internet and retry.
+     * Network error mode -- shown when we cannot reach Firestore.
+     * NEVER allows vault creation. User must connect to internet and retry.
      */
     private void setupNetworkErrorMode() {
         toolbarTitle.setText(R.string.vault_network_error_title);
@@ -254,7 +253,6 @@ public class MasterPasswordActivity extends Activity {
 
         btnAction.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                // Reset UI and retry
                 editPassword.setVisibility(View.VISIBLE);
                 textError.setVisibility(View.GONE);
                 if (cbShowPassword != null) cbShowPassword.setVisibility(View.VISIBLE);
@@ -324,7 +322,7 @@ public class MasterPasswordActivity extends Activity {
 
     private void handleCreate() {
         String password = editPassword.getText().toString();
-        String confirm = editConfirmPassword.getText().toString();
+        String confirm  = editConfirmPassword.getText().toString();
 
         if (password.length() < 8) {
             showError(getString(R.string.master_password_error_short));
@@ -361,11 +359,9 @@ public class MasterPasswordActivity extends Activity {
                                     setupUnlockMode();
                                     break;
                                 case NO_VAULT_EXISTS:
-                                    // Server confirms no vault -- safe to create
                                     performVaultCreation(pwd);
                                     break;
                                 case NETWORK_ERROR:
-                                    // Cannot confirm -- block creation
                                     Log.w(TAG, "[SAFETY] Network error during pre-create check -- blocking");
                                     btnAction.setEnabled(true);
                                     textSubtitle.setText(R.string.master_password_subtitle_create);
@@ -382,18 +378,17 @@ public class MasterPasswordActivity extends Activity {
     }
 
     private void performVaultCreation(final String password) {
-        Log.d(TAG, "[VAULT_CREATED] Starting vault creation...");
+        Log.d(TAG, "[VAULT_CREATED] Starting v4 vault creation...");
 
         keyManager.initializeVault(password, new KeyManager.VaultCallback() {
             public void onSuccess() {
                 runOnUiThread(new Runnable() {
                     public void run() {
-                        Log.d(TAG, "[VAULT_CREATED] SUCCESS");
+                        Log.d(TAG, "[VAULT_CREATED] SUCCESS (v4 architecture)");
                         sessionManager.setPasswordSetFlag(true);
                         sessionManager.updateSessionTimestamp();
                         sessionManager.setEncryptionMigrated(true);
 
-                        // Migrate existing plaintext notes if any
                         migrateExistingPlaintextNotes();
 
                         Toast.makeText(MasterPasswordActivity.this,
@@ -416,8 +411,23 @@ public class MasterPasswordActivity extends Activity {
         });
     }
 
-    // ======================== HANDLE UNLOCK (UPDATED v4) ========================
+    // ======================== HANDLE UNLOCK (v4 UPDATED) ========================
 
+    /**
+     * v4: Unlock flow simplified.
+     *
+     * Purana v3 behavior:
+     * - Check DBK wrapping, PK wrapping separately
+     * - Multiple complex paths depending on what's available
+     *
+     * Naya v4 behavior:
+     * - Sirf password enter karo
+     * - KeyManager.unlockVault() handles everything internally:
+     *   1. Try v4 path (password-derived key decrypts DEK)
+     *   2. Fallback to v3 path (DB Key decrypts UEK) + auto-migrate
+     *   3. Fallback to v2 path (PBKDF2 master key) + auto-migrate
+     * - Clear data ke baad bhi kaam karta hai kyunki Keystore NOT needed
+     */
     private void handleUnlock() {
         final String password = editPassword.getText().toString();
 
@@ -429,36 +439,24 @@ public class MasterPasswordActivity extends Activity {
         btnAction.setEnabled(false);
         textError.setVisibility(View.GONE);
 
-        // Show appropriate message based on unlock path
+        // v4: Simple unlock message -- no need to differentiate paths
         if (textSubtitle != null) {
-            if (keyManager.isVaultInitialized() && !keyManager.hasDBKWrapping()
-                    && keyManager.hasPKWrapping()) {
-                // Clear Data scenario: DBK missing, will use PATH B (PK recovery)
-                textSubtitle.setText("Recovering vault from cloud...");
-                Log.d(TAG, "[UNLOCK] PATH B detected: DBK missing, using PK recovery");
-            } else {
-                textSubtitle.setText("Unlocking vault...");
-            }
+            textSubtitle.setText("Unlocking vault...");
         }
 
-        // New v2+ vault system
+        // New v4 vault system
         if (keyManager.isVaultInitialized()) {
-            Log.d(TAG, "Attempting unlock with vault system (dual-path)");
+            Log.d(TAG, "Attempting v4 vault unlock (password-derived key)");
 
-            // Run unlock on background thread (Argon2 is CPU-intensive)
+            // Run unlock on background thread (Argon2id is CPU-intensive)
             new Thread(new Runnable() {
                 public void run() {
                     final boolean valid = keyManager.unlockVault(password);
                     runOnUiThread(new Runnable() {
                         public void run() {
                             if (valid) {
-                                Log.d(TAG, "[VAULT_UNLOCK_SUCCESS]");
+                                Log.d(TAG, "[VAULT_UNLOCK_SUCCESS] v4");
 
-                                // CRITICAL FIX: Set session state SYNCHRONOUSLY before
-                                // anything else. updateSessionTimestamp() now uses .commit()
-                                // so the timestamp is guaranteed to be persisted before
-                                // we launch MainActivity. This eliminates the race condition
-                                // where isSessionValid() returned false on first launch.
                                 sessionManager.setPasswordSetFlag(true);
                                 sessionManager.updateSessionTimestamp();
                                 sessionManager.setEncryptionMigrated(true);
@@ -508,7 +506,7 @@ public class MasterPasswordActivity extends Activity {
     // ======================== OLD SYSTEM MIGRATION ========================
 
     private void handleOldSystemUnlock(String password) {
-        String saltHex = sessionManager.getOldSaltHex();
+        String saltHex     = sessionManager.getOldSaltHex();
         String verifyToken = sessionManager.getOldVerifyToken();
 
         if (saltHex == null || verifyToken == null) {
@@ -536,7 +534,7 @@ public class MasterPasswordActivity extends Activity {
             return;
         }
 
-        // Old password verified -- migrate to new system
+        // Old password verified -- migrate to new v4 system
         sessionManager.updateSessionTimestamp();
         int oldIterations = sessionManager.getOldIterations();
 
@@ -544,7 +542,6 @@ public class MasterPasswordActivity extends Activity {
         if (migrated) {
             sessionManager.clearOldCredentials();
             sessionManager.setEncryptionMigrated(true);
-            // Ensure vault is uploaded after migration
             keyManager.ensureVaultUploaded();
             Toast.makeText(this, R.string.master_password_set_success, Toast.LENGTH_SHORT).show();
             launchMain();
@@ -642,8 +639,8 @@ public class MasterPasswordActivity extends Activity {
     }
 
     /**
-     * CRITICAL FIX v3: Perform cloud sync BEFORE launching MainActivity.
-     * This ensures that after reinstall, notes are already in local DB
+     * Perform cloud sync BEFORE launching MainActivity.
+     * Ensures that after reinstall/clear data, notes are already in local DB
      * and DEK is fully ready when MainActivity.loadNotes() runs.
      */
     private void launchMain() {
@@ -659,9 +656,6 @@ public class MasterPasswordActivity extends Activity {
             return;
         }
 
-        // CRITICAL: If logged in and cloud sync enabled, perform sync HERE
-        // before going to MainActivity. This guarantees notes are in local DB
-        // with DEK fully ready. No race condition possible.
         if (authManager.isLoggedIn() && prefs.isCloudSyncEnabled()
                 && keyManager.isVaultUnlocked()) {
             Log.d(TAG, "[LAUNCH] Performing pre-launch cloud sync...");
@@ -678,13 +672,11 @@ public class MasterPasswordActivity extends Activity {
                         public void onSyncComplete(final boolean success) {
                             Log.d(TAG, "[LAUNCH] Notes sync complete, success=" + success);
 
-                            // STEP 2: Sync mantras and daily sessions
                             Log.d(TAG, "[LAUNCH] Starting mantra/session sync...");
                             syncManager.syncMantrasAndSessions(new CloudSyncManager.SyncCallback() {
                                 public void onSyncComplete(final boolean mantraSuccess) {
                                     Log.d(TAG, "[LAUNCH] Mantra sync complete, success=" + mantraSuccess);
 
-                                    // STEP 3: Download missing attachment files
                                     Log.d(TAG, "[LAUNCH] Starting attachment download...");
                                     try {
                                         syncManager.downloadAllMissingAttachments();
